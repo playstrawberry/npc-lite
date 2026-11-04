@@ -1,0 +1,18 @@
+[package]
+name = "npc-lite"
+version = "0.1.0"
+edition = "2024"
+description = "Strawberry first-party plugin: NPCs that exist only as packets, with no client mod needed."
+authors = ["Strawberry Interactive LLC"]
+license = "LicenseRef-All-Rights-Reserved"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+strawberry-plugin-api = { path = "../strawberry-plugin-api" }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+# A repository of its own, not a member of a larger workspace.
+[workspace]
