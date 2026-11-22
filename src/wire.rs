@@ -18,6 +18,18 @@ pub const CUSTOM_NAME: u8 = 2;
 pub const CUSTOM_NAME_VISIBLE: u8 = 3;
 /// Entity data index of "silent" (every entity).
 pub const SILENT: u8 = 4;
+/// Entity data index of the pose (every entity): `DATA_POSE`, id 6 in every entity of the engine's
+/// generated `strawberry-data/src/generated/tracked_data.rs` (read 2026-11-08; not copied).
+pub const POSE: u8 = 6;
+/// The SLEEPING pose. The pose is sent as its place in the game's pose list: STANDING 0,
+/// FALL_FLYING 1, SLEEPING 2, SWIMMING 3, ... (the engine's generated `entity_pose.rs` and the
+/// `entity-pose` enum of `strawberry-plugin-wit/v0.1/common.wit` list them in this order). A living
+/// entity in it with no bed lies flat along its body's yaw.
+pub const POSE_SLEEPING: i32 = 2;
+/// The id of the `minecraft:scale` attribute: its place in the `attribute` enum of the plugin API's
+/// `attributes` interface, which is the game's attribute registry id (the engine's generated
+/// `strawberry-data/src/generated/attributes.rs`, `SCALE`, id 30; read 2026-11-21, not copied).
+pub const ATTRIBUTE_SCALE: i32 = 30;
 /// Mannequin: which skin layers are shown.
 pub const MANNEQUIN_SKIN_PARTS: u8 = 16;
 /// Mannequin: the profile its skin comes from.
@@ -26,6 +38,9 @@ pub const MANNEQUIN_PROFILE: u8 = 17;
 pub const MANNEQUIN_IMMOVABLE: u8 = 18;
 /// Mannequin: the line under its name.
 pub const MANNEQUIN_DESCRIPTION: u8 = 19;
+/// The skin models of a profile's skin patch.
+pub const MODEL_WIDE: i32 = 0;
+pub const MODEL_SLIM: i32 = 1;
 /// Every skin layer (cape, jacket, both sleeves, both legs, hat).
 pub const ALL_SKIN_PARTS: u8 = 0x7F;
 
@@ -33,6 +48,8 @@ pub const ALL_SKIN_PARTS: u8 = 0x7F;
 const SER_BYTE: i32 = 0;
 const SER_OPTIONAL_COMPONENT: i32 = 6;
 const SER_BOOLEAN: i32 = 8;
+/// `MetaDataType::POSE` in the engine's generated `meta_data_type.rs`.
+const SER_POSE: i32 = 20;
 const SER_RESOLVABLE_PROFILE: i32 = 41;
 
 /// The protocol id of the mannequin, the player-shaped entity that never enters the tab list.
@@ -82,6 +99,10 @@ pub struct Profile<'a> {
     pub id: Option<(u64, u64)>,
     /// The `textures` property: its value and signature.
     pub textures: Option<(&'a str, Option<&'a str>)>,
+    /// The skin patch: a body texture (`namespace:path` under the pack's `textures`) and the
+    /// model (0 wide, 1 slim) the client draws instead of the skin's.
+    pub body: Option<&'a str>,
+    pub model: Option<i32>,
 }
 
 /// Entity data entries, ended with 0xFF by [`Meta::finish`].
@@ -107,6 +128,12 @@ impl Meta {
     pub fn boolean(&mut self, index: u8, value: bool) {
         self.head(index, SER_BOOLEAN);
         self.0.boolean(value);
+    }
+
+    /// A pose, by its place in the game's pose list (see [`POSE_SLEEPING`]).
+    pub fn pose(&mut self, index: u8, pose: i32) {
+        self.head(index, SER_POSE);
+        self.0.varint(pose);
     }
 
     /// An optional text component, given as its network NBT (what `text-component.encode`
@@ -144,9 +171,16 @@ impl Meta {
             }
             None => buf.varint(0),
         }
-        // No body, cape or elytra texture override and no model override.
-        for _ in 0..4 {
-            buf.boolean(false);
+        // The skin patch: body texture, no cape or elytra override, model.
+        buf.boolean(profile.body.is_some());
+        if let Some(body) = profile.body {
+            buf.string(body);
+        }
+        buf.boolean(false);
+        buf.boolean(false);
+        buf.boolean(profile.model.is_some());
+        if let Some(model) = profile.model {
+            buf.varint(model);
         }
     }
 
@@ -286,6 +320,13 @@ mod tests {
     }
 
     #[test]
+    fn a_pose_is_its_index_the_pose_serializer_and_its_place_in_the_list() {
+        let mut meta = Meta::new();
+        meta.pose(POSE, POSE_SLEEPING);
+        assert_eq!(meta.finish(), [6, 20, 2, 0xFF]);
+    }
+
+    #[test]
     fn a_profile_is_partial_with_its_textures_and_no_overrides() {
         let mut meta = Meta::new();
         meta.profile(
@@ -294,6 +335,7 @@ mod tests {
                 name: None,
                 id: Some((1, 2)),
                 textures: Some(("v", Some("s"))),
+                ..Profile::default()
             },
         );
         let mut want = vec![17, 41, 0, 0, 1];
@@ -312,6 +354,7 @@ mod tests {
                 name: Some("Steve"),
                 id: None,
                 textures: Some(("v", None)),
+                ..Profile::default()
             },
         );
         let mut want = vec![17, 41, 0, 1, 5];
@@ -327,6 +370,43 @@ mod tests {
         let mut meta = Meta::new();
         meta.profile(MANNEQUIN_PROFILE, &Profile::default());
         assert_eq!(meta.finish(), [17, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn a_profile_carries_a_pack_texture_and_its_model_in_the_patch() {
+        // Patch: body (Prefixed Optional Identifier), cape, elytra, model (Prefixed Optional
+        // VarInt: wide 0, slim 1).
+        let mut meta = Meta::new();
+        meta.profile(
+            MANNEQUIN_PROFILE,
+            &Profile {
+                id: Some((1, 2)),
+                body: Some("br:npc/watcher"),
+                model: Some(1),
+                ..Profile::default()
+            },
+        );
+        let mut want = vec![17, 41, 0, 0, 1];
+        want.extend([0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
+        want.push(0);
+        want.extend([1, 14]);
+        want.extend(b"br:npc/watcher");
+        want.extend([0, 0, 1, 1, 0xFF]);
+        assert_eq!(meta.finish(), want);
+
+        let mut meta = Meta::new();
+        meta.profile(
+            MANNEQUIN_PROFILE,
+            &Profile {
+                body: Some("a"),
+                model: Some(0),
+                ..Profile::default()
+            },
+        );
+        assert_eq!(
+            meta.finish(),
+            [17, 41, 0, 0, 0, 0, 1, 1, b'a', 0, 0, 1, 0, 0xFF]
+        );
     }
 
     #[test]

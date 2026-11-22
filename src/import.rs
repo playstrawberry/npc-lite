@@ -1,4 +1,4 @@
-//! `/npc import`: reads a YAML file of NPC saves (`data/import.yml`) and
+//! `/npc import`: reads the YAML NPC saves other server software writes (`data/import.yml`) and
 //! says what became of every row. A one-shot: it never changes an NPC that already exists.
 //!
 //! Only the small part of YAML such a file uses is read. A line it cannot read refuses the whole
@@ -91,6 +91,20 @@ pub struct Report {
     pub rows: Vec<Row>,
     /// The number of the row in the file, and why.
     pub skipped: Vec<(String, Skipped)>,
+}
+
+/// Takes the `console` actions out of the rows, for a sender without the console right
+/// (`dispatch::may_store`): an import never gives an NPC a command with every right that its
+/// sender could not have stored by hand. Each row that lost one says so (`Dropped::Command`).
+pub fn drop_console_actions(rows: &mut [Row]) {
+    for row in rows {
+        let before = row.actions.len();
+        row.actions
+            .retain(|(_, action)| !matches!(action, Action::Console(_)));
+        if row.actions.len() < before && !row.dropped.contains(&Dropped::Command) {
+            row.dropped.push(Dropped::Command);
+        }
+    }
 }
 
 /// Reads the text of a file. An error names the line, never its content.
@@ -521,13 +535,13 @@ last-created-npc-id: 342
 npc:
   '8':
     metadata:
-      cached-skin-uuid: 00000000-0000-4000-8000-000000000001
+      cached-skin-uuid: 05cf000b-6185-44c7-b650-03449aadc9fa
     traits:
       scoreboardtrait:
         tags:
         - SOME_TAG
       owner:
-        uuid: 00000000-0000-3000-8000-000000000002
+        uuid: 8e202233-cbd6-3b66-b0dc-c358a6bed8e9
       skintrait:
         signature: c2lnbmF0dXJl
         skinName: Some_Name
@@ -553,7 +567,7 @@ npc:
     name: '&aSitter'
     navigator:
       avoidwater: false
-    uuid: 00000000-0000-4000-8000-000000000003
+    uuid: 7a3c4490-f32d-44c0-a649-f4bf4d2f4e10
   '139':
     metadata:
       minecraft-ai: true
@@ -571,7 +585,7 @@ npc:
           meta: rO0ABXNyABpvcmc
       location:
         world: spawn_world
-        worldid: 00000000-0000-4000-8000-000000000004
+        worldid: 6a2f235f-146b-46a6-aa6c-2dad26cd5978
         x: -36.5
         y: 63.0
         z: 114.1
@@ -616,7 +630,7 @@ npc:
   '10':
     traits:
       location:
-        worldid: 00000000-0000-4000-8000-000000000005
+        worldid: 8822e911-b550-4dc4-a3c3-302eb7a1cd03
         x: 1
         y: 2
         z: 3
@@ -755,6 +769,26 @@ npc:
         assert_eq!(worker.place.x, -36.5);
         assert!(worker.dropped.contains(&Dropped::Equipment));
         assert!(worker.dropped.contains(&Dropped::VanillaAi));
+    }
+
+    #[test]
+    fn an_import_without_the_console_right_keeps_no_console_action_and_says_so() {
+        let mut report = read_saves(SAMPLE).unwrap();
+        for row in &mut report.rows {
+            row.dropped.retain(|d| *d != Dropped::Command);
+        }
+        drop_console_actions(&mut report.rows);
+        let menu = row(&report, "npc-311");
+        assert_eq!(
+            menu.actions,
+            vec![(Trigger::Any, Action::Command("warp spawn".into()))]
+        );
+        assert!(menu.dropped.contains(&Dropped::Command));
+        assert!(report.rows.iter().all(|r| {
+            r.actions
+                .iter()
+                .all(|(_, a)| !matches!(a, Action::Console(_)))
+        }));
     }
 
     #[test]

@@ -1,0 +1,14 @@
+[package]
+name = "command-rules"
+version = "0.1.0"
+edition = "2024"
+description = "Strawberry first-party library: which commands a script or a server owner's file may never run from the console, and which command names belong to the platform. One list for miniscript and user_interface, and the one message with which a pressed button of a file starts a Mini-script."
+authors = ["Strawberry Interactive LLC"]
+license = "LicenseRef-Strawberry-Source-Available-1.0"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+# Plain Rust with no dependency.
+[dependencies]

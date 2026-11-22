@@ -28,6 +28,8 @@ pub const ENTITY_ID_BASE: i32 = 0x7A00_0000;
 pub const SEAT_ID_BASE: i32 = 0x7B00_0000;
 /// The entity a sitting NPC rides: it draws nothing and has no box.
 pub const SEAT_TYPE: &str = "text_display";
+/// Why an NPC that would both sit and lie is refused (a plugin's spec, the data file).
+pub const SIT_AND_LIE: &str = "an NPC sits or lies, not both";
 /// The languages a name can be given for.
 pub const LANGUAGES: [&str; 4] = ["en", "fr", "es", "tr"];
 /// One plugin may hold this many NPCs, so it cannot use up the server's limit.
@@ -38,6 +40,11 @@ pub const DEFAULT_RANGE: u32 = 48;
 pub const MIN_RANGE: u32 = 8;
 /// A client sees entities at most this far (view distance 8).
 pub const MAX_RANGE: u32 = 128;
+/// An NPC is drawn at its normal size unless its scale says otherwise.
+pub const DEFAULT_SCALE: f32 = 1.0;
+/// The range of the game's `minecraft:scale` attribute.
+pub const MIN_SCALE: f32 = 0.0625;
+pub const MAX_SCALE: f32 = 16.0;
 const FORMAT_VERSION: u64 = 1;
 const PLAYER_RIDE_OFFSET: f64 = 0.6;
 /// Entity types an NPC cannot be: a player entity needs a tab-list entry (a player NPC is a
@@ -74,8 +81,12 @@ pub enum Trigger {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// A chat line to the player (`&` colour codes, `{player}` for his name).
-    Message(String),
+    /// A chat line to the player (`&` colour codes, `{player}` for his name): the line of his
+    /// language in `texts` when it has one, else `text`.
+    Message {
+        text: String,
+        texts: BTreeMap<String, String>,
+    },
     /// A command the player runs (without the `/`).
     Command(String),
     /// A command the console runs (`{player}` for the player's name).
@@ -83,6 +94,26 @@ pub enum Action {
     Teleport(Place),
     /// Opens the menu of this name.
     Menu(String),
+    /// Opens the server's own `user_interface` file of this id (a screen, page or store with an
+    /// `open_command`, `open_key` or `open_item`) for the player, as its command would.
+    Ui(String),
+}
+
+impl Action {
+    /// A message with one text for every language.
+    #[must_use]
+    pub fn message(text: &str) -> Self {
+        Self::Message {
+            text: text.to_string(),
+            texts: BTreeMap::new(),
+        }
+    }
+}
+
+/// The line of a message a player of `language` reads: his language's, else the message's text.
+#[must_use]
+pub fn line_for<'a>(text: &'a str, texts: &'a BTreeMap<String, String>, language: &str) -> &'a str {
+    texts.get(language).map_or(text, String::as_str)
 }
 
 /// A skin: the account it was taken from and its signed textures.
@@ -91,6 +122,21 @@ pub struct Skin {
     pub from: String,
     pub value: String,
     pub signature: Option<String>,
+}
+
+/// The arms a skin is drawn with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkinModel {
+    Wide,
+    Slim,
+}
+
+/// A skin from the server's resource pack, drawn instead of the profile's (26.3's skin patch):
+/// `texture` is `namespace:path` for `assets/<namespace>/textures/<path>.png`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkinPatch {
+    pub texture: String,
+    pub model: SkinModel,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +152,11 @@ pub struct Npc {
     pub names: BTreeMap<String, String>,
     pub name_visible: bool,
     pub skin: Option<Skin>,
+    /// A player NPC drawn, for each player who sees it, in that player's own skin (`skin` is then
+    /// unused). Each viewer is sent only his own skin.
+    pub viewer_skin: bool,
+    /// A player NPC drawn with a texture of the server's resource pack instead of its skin.
+    pub skin_patch: Option<SkinPatch>,
     pub glow: bool,
     /// Turns to the nearest player (off unless set: a turning NPC costs packets).
     pub look: bool,
@@ -113,8 +164,13 @@ pub struct Npc {
     pub baby: bool,
     /// Sits on an invisible seat of its own.
     pub sit: bool,
-    /// The plugin that made it (`None`: the server owner, with `/npc`). Only that plugin changes it,
-    /// and clicks on it are answered to that plugin instead of running actions.
+    /// Lies on the ground, as a player sleeping without a bed (never with `sit`).
+    pub lie: bool,
+    /// How large it is drawn, as the game's `minecraft:scale` attribute: 1 is the normal size, and a
+    /// larger figure is drawn from farther away (`valid_scale`).
+    pub scale: f32,
+    /// The plugin that made it (`None`: the server owner, with `/npc`). Only that plugin changes it;
+    /// a click on it runs its actions when it has some, else the plugin asks about the click.
     pub owner: Option<String>,
     /// Written to the data file (a plugin's NPC can be kept in memory only).
     pub persist: bool,
@@ -229,14 +285,21 @@ pub struct Spec {
     pub names: BTreeMap<String, String>,
     pub name_visible: bool,
     pub skin: Option<Skin>,
+    /// Each viewer sees the NPC in his own skin.
+    pub viewer_skin: bool,
+    pub skin_patch: Option<SkinPatch>,
     pub glow: bool,
     pub look: bool,
     pub baby: bool,
     pub sit: bool,
+    pub lie: bool,
+    pub scale: f32,
     pub persist: bool,
     pub range: u32,
     pub cooldown_ms: u32,
     pub permission: Option<String>,
+    /// What a click does; none: the plugin asks about each click itself.
+    pub actions: Vec<(Trigger, Action)>,
 }
 
 /// What [`Store::put_owned`] did.
@@ -293,9 +356,62 @@ pub fn owned_id(owner: &str, key: &str) -> String {
 /// A name per language: only the known languages, each a valid text.
 #[must_use]
 pub fn valid_names(names: &BTreeMap<String, String>) -> bool {
-    names.iter().all(|(language, text)| {
-        LANGUAGES.contains(&language.as_str()) && valid_text(text, MAX_NAME)
-    })
+    valid_texts(names, MAX_NAME)
+}
+
+/// Texts per language: only the known languages, each a valid text of at most `max` characters.
+#[must_use]
+pub fn valid_texts(texts: &BTreeMap<String, String>, max: usize) -> bool {
+    texts
+        .iter()
+        .all(|(language, text)| LANGUAGES.contains(&language.as_str()) && valid_text(text, max))
+}
+
+/// A texture of a resource pack as the game names it: `namespace:path` (or `path` for
+/// `minecraft:`), at most 256 characters; a namespace of a-z, 0-9, `_`, `-`, `.`, a path of those
+/// and `/`.
+#[must_use]
+pub fn valid_texture(texture: &str) -> bool {
+    let (namespace, path) = texture.split_once(':').unwrap_or(("minecraft", texture));
+    let allowed = |b: u8, slash: bool| {
+        b.is_ascii_lowercase()
+            || b.is_ascii_digit()
+            || matches!(b, b'_' | b'-' | b'.')
+            || (slash && b == b'/')
+    };
+    texture.len() <= 256
+        && !namespace.is_empty()
+        && !path.is_empty()
+        && namespace.bytes().all(|b| allowed(b, false))
+        && path.bytes().all(|b| allowed(b, true))
+}
+
+/// The id of a `user_interface` file: `[a-z0-9_.:-]`, 1 to 64 characters, as that plugin names
+/// its screens, pages and stores. Never a path.
+#[must_use]
+pub fn valid_ui_file(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.:-".contains(&b))
+}
+
+/// A skin model by its name in the game's data (`wide`, `slim`).
+#[must_use]
+pub fn parse_model(name: &str) -> Option<SkinModel> {
+    match name {
+        "wide" => Some(SkinModel::Wide),
+        "slim" => Some(SkinModel::Slim),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn model_name(model: SkinModel) -> &'static str {
+    match model {
+        SkinModel::Wide => "wide",
+        SkinModel::Slim => "slim",
+    }
 }
 
 /// A Minecraft account name: 1 to 16 of letters, digits and `_`.
@@ -348,6 +464,12 @@ pub fn valid_skin(skin: &Skin) -> bool {
 #[must_use]
 pub fn can_be_baby(kind: &Kind) -> bool {
     matches!(kind, Kind::Mob(name) if wire::baby_index(name).is_some())
+}
+
+/// Whether a scale is allowed: a finite number in the range of the `minecraft:scale` attribute.
+#[must_use]
+pub fn valid_scale(scale: f32) -> bool {
+    (MIN_SCALE..=MAX_SCALE).contains(&scale)
 }
 
 /// Whether a range in blocks is allowed.
@@ -419,6 +541,7 @@ pub enum ActionError {
     BadText,
     BadPlace,
     BadMenu,
+    BadUi,
 }
 
 /// An action from its type and the rest of the command line. A teleport takes `x y z`, then
@@ -428,7 +551,7 @@ pub fn parse_action(kind: &str, value: &str, here: Option<&Place>) -> Result<Act
     let value = value.trim();
     match kind {
         "message" => valid_text(value, MAX_MESSAGE)
-            .then(|| Action::Message(value.to_string()))
+            .then(|| Action::message(value))
             .ok_or(ActionError::BadText),
         "command" | "console" => {
             let command = value.strip_prefix('/').unwrap_or(value).trim();
@@ -444,6 +567,9 @@ pub fn parse_action(kind: &str, value: &str, here: Option<&Place>) -> Result<Act
         "menu" => valid_id(value)
             .then(|| Action::Menu(value.to_string()))
             .ok_or(ActionError::BadMenu),
+        "ui" => valid_ui_file(value)
+            .then(|| Action::Ui(value.to_string()))
+            .ok_or(ActionError::BadUi),
         "teleport" => parse_place(value, here)
             .map(Action::Teleport)
             .ok_or(ActionError::BadPlace),
@@ -484,10 +610,15 @@ fn parse_place(value: &str, here: Option<&Place>) -> Option<Place> {
 #[must_use]
 pub fn action_text(action: &Action) -> String {
     match action {
-        Action::Message(text) => format!("message {text}"),
+        Action::Message { text, texts } if texts.is_empty() => format!("message {text}"),
+        Action::Message { text, texts } => {
+            let languages: Vec<&str> = texts.keys().map(String::as_str).collect();
+            format!("message {text} ({})", languages.join(", "))
+        }
         Action::Command(command) => format!("command /{command}"),
         Action::Console(command) => format!("console {command}"),
         Action::Menu(name) => format!("menu {name}"),
+        Action::Ui(file) => format!("ui {file}"),
         Action::Teleport(p) => format!(
             "teleport {:.2} {:.2} {:.2} {:.1} {:.1} {}",
             p.x, p.y, p.z, p.yaw, p.pitch, p.world
@@ -531,10 +662,14 @@ impl Store {
             names: BTreeMap::new(),
             name_visible: true,
             skin: None,
+            viewer_skin: false,
+            skin_patch: None,
             glow: false,
             look: false,
             baby: false,
             sit: false,
+            lie: false,
+            scale: DEFAULT_SCALE,
             owner: None,
             persist: true,
             range: DEFAULT_RANGE,
@@ -590,17 +725,21 @@ impl Store {
                 names: spec.names,
                 name_visible: spec.name_visible,
                 skin: spec.skin,
+                viewer_skin: spec.viewer_skin,
+                skin_patch: spec.skin_patch,
                 glow: spec.glow,
                 look: spec.look,
                 baby: spec.baby,
                 sit: spec.sit,
+                lie: spec.lie,
+                scale: spec.scale,
                 owner: Some(owner.to_string()),
                 persist: spec.persist,
                 range: spec.range,
                 cooldown_ms: spec.cooldown_ms,
                 permission: spec.permission,
                 hidden,
-                actions: Vec::new(),
+                actions: spec.actions,
             },
         );
         Ok(Put {
@@ -618,6 +757,22 @@ impl Store {
             .filter(|npc| npc.owner.as_deref() == Some(owner))
             .map(|npc| npc.key().to_string())
             .collect()
+    }
+
+    /// Removes every NPC of the plugin `owner` that lives in memory only (`persist: false`), in one
+    /// pass, and answers each one's name and number so the caller can take it from its viewers.
+    /// The owner is matched exactly (`lobby` never takes `lobby-extra`'s), NPCs kept in the file stay,
+    /// and so do the server owner's own (they have no owner).
+    pub fn remove_memory_only_of(&mut self, owner: &str) -> Vec<(String, u32)> {
+        let mut gone = Vec::new();
+        self.npcs.retain(|id, npc| {
+            let takes = !npc.persist && npc.owner.as_deref() == Some(owner);
+            if takes {
+                gone.push((id.clone(), npc.num));
+            }
+            !takes
+        });
+        gone
     }
 
     /// Takes over the NPCs kept in memory only from the store this one replaces (`/npc reload`).
@@ -723,10 +878,11 @@ fn place_json(place: &Place, object: &mut Map<String, Value>) {
 fn action_json(action: &Action) -> Value {
     let mut object = Map::new();
     let (kind, value) = match action {
-        Action::Message(text) => ("message", Some(text)),
+        Action::Message { text, .. } => ("message", Some(text)),
         Action::Command(command) => ("command", Some(command)),
         Action::Console(command) => ("console", Some(command)),
         Action::Menu(name) => ("menu", Some(name)),
+        Action::Ui(file) => ("ui", Some(file)),
         Action::Teleport(place) => {
             place_json(place, &mut object);
             ("teleport", None)
@@ -735,6 +891,12 @@ fn action_json(action: &Action) -> Value {
     object.insert("type".into(), json!(kind));
     if let Some(value) = value {
         object.insert("value".into(), json!(value));
+    }
+    // An older version reads `value` and leaves `texts`: the message stays, in one language.
+    if let Action::Message { texts, .. } = action
+        && !texts.is_empty()
+    {
+        object.insert("texts".into(), json!(texts));
     }
     Value::Object(object)
 }
@@ -752,15 +914,29 @@ fn npc_json(npc: &Npc) -> Value {
         object.insert("owner".into(), json!(owner));
     }
     object.insert("sit".into(), json!(npc.sit));
+    object.insert("lie".into(), json!(npc.lie));
     object.insert("name_visible".into(), json!(npc.name_visible));
     let skin = npc
         .skin
         .as_ref()
         .map(|skin| json!({"from": skin.from, "value": skin.value, "signature": skin.signature}));
     object.insert("skin".into(), json!(skin));
+    // Written only when set, so that a file without one stays readable by an older version.
+    if npc.viewer_skin {
+        object.insert("viewer_skin".into(), json!(true));
+    }
+    if let Some(patch) = &npc.skin_patch {
+        object.insert("texture".into(), json!(patch.texture));
+        object.insert("model".into(), json!(model_name(patch.model)));
+    }
     object.insert("glow".into(), json!(npc.glow));
     object.insert("look".into(), json!(npc.look));
     object.insert("baby".into(), json!(npc.baby));
+    // Written only when set, so that a file without one stays readable by an older version.
+    #[allow(clippy::float_cmp)]
+    if npc.scale != DEFAULT_SCALE {
+        object.insert("scale".into(), json!(npc.scale));
+    }
     object.insert("range".into(), json!(npc.range));
     object.insert("cooldown_ms".into(), json!(npc.cooldown_ms));
     object.insert("permission".into(), json!(npc.permission));
@@ -843,11 +1019,21 @@ fn read_action(value: &Value) -> Result<Action, String> {
         return read_place(object).map(Action::Teleport);
     }
     let text = text_field(object, "value")?;
-    let action =
+    let mut action =
         parse_action(&kind, &text, None).map_err(|e| format!("bad {kind} action: {e:?}"))?;
     // The file holds the command without its `/`; one with it was not written by the plugin.
     if action_json(&action).get("value") != Some(&Value::String(text)) {
         return Err(format!("bad {kind} action"));
+    }
+    if let (Action::Message { texts, .. }, Some(list)) = (&mut action, object.get("texts")) {
+        let list = list.as_object().ok_or("texts is not an object")?;
+        for (language, line) in list {
+            let line = line.as_str().ok_or("texts holds a non-text")?;
+            texts.insert(language.clone(), line.to_string());
+        }
+        if !valid_texts(texts, MAX_MESSAGE) {
+            return Err("bad message texts".into());
+        }
     }
     Ok(action)
 }
@@ -900,6 +1086,29 @@ fn read_npc(value: &Value) -> Result<Npc, String> {
             Some(skin)
         }
         _ => return Err("skin is not an object".into()),
+    };
+    // Written only when set, so a file without it stays readable by an older version.
+    let viewer_skin = match object.get("viewer_skin") {
+        None => false,
+        Some(value) => value.as_bool().ok_or("viewer_skin is not true or false")?,
+    };
+    // Written by later versions only, and only when set.
+    let skin_patch = match object.get("texture") {
+        None => None,
+        Some(value) => {
+            let texture = value
+                .as_str()
+                .filter(|t| valid_texture(t))
+                .ok_or("bad texture")?;
+            let model = match object.get("model") {
+                None => SkinModel::Wide,
+                Some(value) => value.as_str().and_then(parse_model).ok_or("bad model")?,
+            };
+            Some(SkinPatch {
+                texture: texture.to_string(),
+                model,
+            })
+        }
     };
     let cooldown = field(object, "cooldown_ms")?
         .as_u64()
@@ -959,6 +1168,13 @@ fn read_npc(value: &Value) -> Result<Npc, String> {
         None => false,
         Some(value) => value.as_bool().ok_or("sit is not true or false")?,
     };
+    let lie = match object.get("lie") {
+        None => false,
+        Some(value) => value.as_bool().ok_or("lie is not true or false")?,
+    };
+    if sit && lie {
+        return Err(SIT_AND_LIE.into());
+    }
     let baby = match object.get("baby") {
         None => false,
         Some(value) => value.as_bool().ok_or("baby is not true or false")? && can_be_baby(&kind),
@@ -971,6 +1187,15 @@ fn read_npc(value: &Value) -> Result<Npc, String> {
             .filter(|r| valid_range(*r))
             .ok_or("bad range")?,
     };
+    let scale = match object.get("scale") {
+        None => DEFAULT_SCALE,
+        #[allow(clippy::cast_possible_truncation)]
+        Some(value) => value
+            .as_f64()
+            .map(|scale| scale as f32)
+            .filter(|scale| valid_scale(*scale))
+            .ok_or("bad scale")?,
+    };
     Ok(Npc {
         id,
         num,
@@ -981,10 +1206,14 @@ fn read_npc(value: &Value) -> Result<Npc, String> {
         names,
         name_visible: flag(object, "name_visible")?,
         skin,
+        viewer_skin,
+        skin_patch,
         glow: flag(object, "glow")?,
         look: flag(object, "look")?,
         baby,
         sit,
+        lie,
+        scale,
         owner,
         persist: true,
         range,
@@ -1071,13 +1300,30 @@ mod tests {
         guide.hidden.insert(wire::uuid_string((5, 6)));
         guide
             .actions
-            .push((Trigger::Any, Action::Message("Hello {player}".into())));
+            .push((Trigger::Any, Action::message("Hello {player}")));
+        guide.actions.push((
+            Trigger::Right,
+            Action::Message {
+                text: "Welcome".into(),
+                texts: BTreeMap::from([
+                    ("fr".to_string(), "Bienvenue".to_string()),
+                    ("tr".to_string(), "Hoş geldin".to_string()),
+                ]),
+            },
+        ));
+        guide.skin_patch = Some(SkinPatch {
+            texture: "br:npc/watcher".into(),
+            model: SkinModel::Slim,
+        });
         guide
             .actions
             .push((Trigger::Right, Action::Command("spawn".into())));
         guide
             .actions
             .push((Trigger::Left, Action::Console("give {player} bread".into())));
+        guide
+            .actions
+            .push((Trigger::Right, Action::Ui("notebook".into())));
         guide.actions.push((Trigger::Any, Action::Teleport(here())));
         guide
             .actions
@@ -1085,6 +1331,8 @@ mod tests {
         let trader = store.npcs.get_mut("trader").unwrap();
         trader.name = None;
         trader.baby = true;
+        trader.lie = true;
+        trader.scale = 3.0;
         trader.range = 64;
         store.menus.insert(
             "shop".into(),
@@ -1111,6 +1359,117 @@ mod tests {
         let store = full_store();
         let text = store.to_json();
         assert_eq!(Store::from_json(&text), Ok(store));
+    }
+
+    #[test]
+    fn a_pack_texture_is_checked_and_only_written_when_set() {
+        for good in [
+            "br:npc/watcher",
+            "entity/player/wide/steve",
+            "a.b-c_d:x/y.z",
+            "minecraft:entity/player/slim/alex",
+        ] {
+            assert!(valid_texture(good), "{good}");
+        }
+        for bad in [
+            "",
+            "Br:x",
+            "a:b:c",
+            "a:",
+            ":b",
+            "a b",
+            "a:x y",
+            "é:x",
+            &"a".repeat(257),
+        ] {
+            assert!(!valid_texture(bad), "{bad}");
+        }
+        assert_eq!(parse_model("wide"), Some(SkinModel::Wide));
+        assert_eq!(parse_model("slim"), Some(SkinModel::Slim));
+        assert_eq!(parse_model("Slim"), None);
+        assert_eq!(parse_model("classic"), None);
+        let text = full_store().to_json();
+        assert!(text.contains("\"texture\": \"br:npc/watcher\""), "{text}");
+        assert_eq!(
+            text.matches("\"texture\"").count(),
+            1,
+            "an NPC without one writes nothing new, so an older version reads the file"
+        );
+        assert!(Store::from_json(&text.replace("br:npc/watcher", "BR:npc")).is_err());
+        assert!(Store::from_json(&text.replace("\"slim\"", "\"classic\"")).is_err());
+    }
+
+    #[test]
+    fn a_message_has_a_line_per_language_and_the_file_checks_them() {
+        let text = full_store().to_json();
+        // An older version reads `value` and leaves `texts`: the message stays, in one language.
+        assert!(text.contains("\"value\": \"Welcome\""), "{text}");
+        assert!(text.contains("\"texts\""), "{text}");
+        assert_eq!(
+            text.matches("\"texts\"").count(),
+            1,
+            "only where there are some"
+        );
+        assert!(
+            Store::from_json(&text.replace("\"fr\": \"Bienvenue\"", "\"de\": \"Willkommen\""))
+                .is_err()
+        );
+        assert!(Store::from_json(&text.replace("\"Bienvenue\"", "\"\"")).is_err());
+        let welcome = Action::Message {
+            text: "Welcome".into(),
+            texts: BTreeMap::from([("tr".to_string(), "Hoş geldin".to_string())]),
+        };
+        assert_eq!(action_text(&welcome), "message Welcome (tr)");
+        assert_eq!(action_text(&Action::message("Hi")), "message Hi");
+        let Action::Message { text, texts } = &welcome else {
+            unreachable!()
+        };
+        assert_eq!(line_for(text, texts, "tr"), "Hoş geldin");
+        assert_eq!(
+            line_for(text, texts, "fr"),
+            "Welcome",
+            "no French line: the text"
+        );
+        assert_eq!(line_for(text, texts, "en"), "Welcome");
+    }
+
+    #[test]
+    fn a_plugin_npc_keeps_its_actions_and_pack_texture() {
+        let mut store = Store::default();
+        let mut given = spec();
+        given.actions = vec![(Trigger::Right, Action::message("Hi"))];
+        given.skin_patch = Some(SkinPatch {
+            texture: "br:npc/watcher".into(),
+            model: SkinModel::Wide,
+        });
+        store
+            .put_owned("core", "boss", given.clone(), (1, 1))
+            .unwrap();
+        let boss = &store.npcs["core.boss"];
+        assert_eq!(boss.actions, given.actions);
+        assert_eq!(boss.skin_patch, given.skin_patch);
+    }
+
+    #[test]
+    fn a_viewer_skin_is_kept_and_only_written_when_set() {
+        let mut store = Store::default();
+        let mut given = spec();
+        given.viewer_skin = true;
+        store.put_owned("lobby", "guide", given, (1, 1)).unwrap();
+        store.put_owned("lobby", "boss", spec(), (2, 2)).unwrap();
+        assert!(store.npcs["lobby.guide"].viewer_skin);
+        let text = store.to_json();
+        assert_eq!(
+            text.matches("viewer_skin").count(),
+            1,
+            "only the guide writes it"
+        );
+        let read = Store::from_json(&text).unwrap();
+        assert_eq!(read, store);
+        assert!(!read.npcs["lobby.boss"].viewer_skin);
+        let broken = text.replace(r#""viewer_skin": true"#, r#""viewer_skin": "yes""#);
+        assert_ne!(broken, text);
+        assert!(Store::from_json(&broken).is_err());
     }
 
     #[test]
@@ -1142,6 +1501,23 @@ mod tests {
         assert!(!Store::from_json(&wrong).unwrap().npcs["guide"].baby);
     }
 
+    #[test]
+    fn a_scale_is_checked_kept_in_the_file_and_an_older_file_reads_one() {
+        assert!(valid_scale(MIN_SCALE) && valid_scale(DEFAULT_SCALE) && valid_scale(MAX_SCALE));
+        assert!(!valid_scale(0.0) && !valid_scale(MAX_SCALE + 0.5) && !valid_scale(-1.0));
+        assert!(!valid_scale(f32::NAN) && !valid_scale(f32::INFINITY));
+        let text = full_store().to_json();
+        let read = Store::from_json(&text).unwrap();
+        assert!((read.npcs["trader"].scale - 3.0).abs() < f32::EPSILON);
+        assert!((read.npcs["guide"].scale - DEFAULT_SCALE).abs() < f32::EPSILON);
+        // The default is not written, so an older version reads the file.
+        assert_eq!(text.matches("\"scale\"").count(), 1);
+        assert!(Store::from_json(&text.replace("\"scale\": 3.0", "\"scale\": 40")).is_err());
+        assert!(Store::from_json(&text.replace("\"scale\": 3.0", "\"scale\": \"big\"")).is_err());
+        let old = Store::from_json(&text.replace("\"scale\": 3.0,", "")).unwrap();
+        assert!((old.npcs["trader"].scale - DEFAULT_SCALE).abs() < f32::EPSILON);
+    }
+
     fn spec() -> Spec {
         Spec {
             kind: Kind::Player,
@@ -1150,15 +1526,31 @@ mod tests {
             names: BTreeMap::new(),
             name_visible: true,
             skin: None,
+            viewer_skin: false,
+            skin_patch: None,
             glow: false,
             look: false,
             baby: false,
             sit: false,
+            lie: false,
+            scale: DEFAULT_SCALE,
             persist: true,
             range: 112,
             cooldown_ms: 1000,
             permission: None,
+            actions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_create_on_an_existing_key_answers_the_same_entity_id() {
+        let mut store = Store::default();
+        let first = store.put_owned("core", "boss", spec(), (1, 1)).unwrap();
+        let again = store.put_owned("core", "boss", spec(), (2, 2)).unwrap();
+        assert!(again.replaced && !first.replaced);
+        assert_eq!(entity_id(again.num), entity_id(first.num));
+        assert_eq!(store.npcs["core.boss"].entity_id(), entity_id(first.num));
+        assert_eq!(num_of(store.npcs["core.boss"].entity_id()), Some(first.num));
     }
 
     #[test]
@@ -1241,6 +1633,66 @@ mod tests {
         assert_eq!(read.next_num, temp.num + 1);
     }
 
+    fn put(store: &mut Store, owner: &str, key: &str, persist: bool, uuid: u64) -> u32 {
+        let mut spec = spec();
+        spec.persist = persist;
+        store.put_owned(owner, key, spec, (uuid, uuid)).unwrap().num
+    }
+
+    #[test]
+    fn a_disable_removes_the_non_persistent_figures_of_that_script_and_keeps_its_persistent_ones() {
+        let mut store = Store::default();
+        let temp = put(&mut store, "lobby", "guide", false, 1);
+        let other_temp = put(&mut store, "lobby", "porter", false, 2);
+        put(&mut store, "lobby", "keeper", true, 3);
+        let mut gone = store.remove_memory_only_of("lobby");
+        gone.sort();
+        assert_eq!(
+            gone,
+            vec![
+                ("lobby.guide".to_string(), temp),
+                ("lobby.porter".to_string(), other_temp)
+            ]
+        );
+        assert_eq!(store.npcs.keys().collect::<Vec<_>>(), vec!["lobby.keeper"]);
+        assert!(
+            store.remove_memory_only_of("lobby").is_empty(),
+            "nothing is left to take"
+        );
+    }
+
+    #[test]
+    fn a_disable_leaves_other_scripts_and_the_server_owners_figures() {
+        let mut store = Store::default();
+        put(&mut store, "lobby", "guide", false, 1);
+        put(&mut store, "other", "guide", false, 2);
+        store.create("mine", Kind::Player, here(), (8, 8)).unwrap();
+        store.npcs.get_mut("mine").unwrap().persist = false;
+        let gone = store.remove_memory_only_of("lobby");
+        assert_eq!(gone.len(), 1);
+        assert!(store.npcs.contains_key("other.guide"));
+        assert!(
+            store.npcs.contains_key("mine"),
+            "a /npc figure has no owner script"
+        );
+        assert!(store.remove_memory_only_of("nobody").is_empty());
+        assert_eq!(store.npcs.len(), 2);
+    }
+
+    #[test]
+    fn a_disable_names_the_owner_exactly_and_never_by_prefix() {
+        let mut store = Store::default();
+        put(&mut store, "lobby", "guide", false, 1);
+        put(&mut store, "lobby-extra", "guide", false, 2);
+        put(&mut store, "lob", "guide", false, 3);
+        let gone = store.remove_memory_only_of("lobby");
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].0, "lobby.guide");
+        let mut left: Vec<_> = store.npcs.keys().cloned().collect();
+        left.sort();
+        assert_eq!(left, vec!["lob.guide", "lobby-extra.guide"]);
+    }
+
     #[test]
     fn a_name_is_read_per_language_and_the_file_checks_owner_and_names() {
         let mut store = full_store();
@@ -1263,9 +1715,31 @@ mod tests {
         );
         let older = text
             .replace("\"names\": {},", "")
-            .replace("\"sit\": false,", "");
-        assert!(!older.contains("names") && !older.contains("\"sit\""));
+            .replace("\"sit\": false,", "")
+            .replace("\"lie\": false,", "");
+        assert!(
+            !older.contains("names") && !older.contains("\"sit\"") && !older.contains("\"lie\"")
+        );
         assert!(Store::from_json(&older).is_ok());
+    }
+
+    #[test]
+    fn a_lying_npc_is_kept_and_never_also_sits() {
+        let store = full_store();
+        assert!(store.npcs["trader"].lie && !store.npcs["trader"].sit);
+        assert!(!store.npcs["guide"].lie && store.npcs["guide"].sit);
+        let text = store.to_json();
+        assert!(text.contains("\"lie\": true"));
+        assert!(Store::from_json(&text).unwrap().npcs["trader"].lie);
+        // A file that has an NPC both sitting and lying is refused, as a plugin's spec is.
+        let both = text.replace("\"lie\": false", "\"lie\": true");
+        assert!(Store::from_json(&both).unwrap_err().contains(SIT_AND_LIE));
+        assert!(Store::from_json(&text.replace("\"lie\": true", "\"lie\": 1")).is_err());
+        let mut owned = Store::default();
+        let mut lying = spec();
+        lying.lie = true;
+        owned.put_owned("core", "boss", lying, (1, 1)).unwrap();
+        assert!(owned.npcs["core.boss"].lie);
     }
 
     #[test]
@@ -1381,7 +1855,7 @@ mod tests {
         let place = here();
         assert_eq!(
             parse_action("message", " Hi {player} ", None),
-            Ok(Action::Message("Hi {player}".into()))
+            Ok(Action::message("Hi {player}"))
         );
         assert_eq!(
             parse_action("command", "/warp spawn", None),
@@ -1399,6 +1873,28 @@ mod tests {
             parse_action("menu", "Shop!", None),
             Err(ActionError::BadMenu)
         );
+        assert_eq!(
+            parse_action("ui", "notebook", None),
+            Ok(Action::Ui("notebook".into()))
+        );
+        assert_eq!(
+            parse_action("ui", "backrooms:map.v2", None),
+            Ok(Action::Ui("backrooms:map.v2".into()))
+        );
+        let long = "a".repeat(65);
+        for bad in [
+            "",
+            "Notebook",
+            "../notebook",
+            "screens/notebook",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                parse_action("ui", bad, None),
+                Err(ActionError::BadUi),
+                "{bad}"
+            );
+        }
         assert_eq!(
             parse_action("teleport", "here", Some(&place)),
             Ok(Action::Teleport(place.clone()))

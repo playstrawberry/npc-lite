@@ -3,9 +3,12 @@
 //! - **Packets only.** An NPC is never a server entity: the server keeps no entity, ticks nothing
 //!   and saves nothing in the world. Each player near an NPC is sent it (`c-spawn-entity` and
 //!   `c-set-entity-metadata`) and it is taken away (`c-remove-entities`) when he goes away.
+//! - **One path for Java and Bedrock viewers.** A Java player is sent these packets with
+//!   `java-player.send-packet`, a Bedrock player the same ones with `bedrock-player.send-java-packet`
+//!   (the engine draws them in Bedrock's form); no entity is made for either.
 //! - **Player NPCs** are mannequins, the player-shaped entity of 26.3 with a skin from a profile
 //!   in its entity data: they never enter the tab list. The skin is a Minecraft account's signed
-//!   textures, looked up through the server (`skins.lookup`) or taken from
+//!   textures, looked up through the server (`skins.lookup`, as SkinBringer does) or taken from
 //!   an online player.
 //! - **Mob NPCs**: any other entity type.
 //! - **Range**: one scan every 10 ticks while a player is near an NPC, every 20 otherwise, no
@@ -47,15 +50,16 @@ use strawberry_plugin_api::{
     commands::CommandHandler,
     common::GameMode,
     events::{
-        DialogClickActionEvent, EventData, EventHandler, FailureVerdict, HandlerOptions,
-        HandlerPriority, PlayerChangeWorldEvent, PlayerInteractUnknownEntityEvent,
-        PlayerLeaveEvent, PlayerLocaleChangeEvent, PlayerRespawnEvent,
+        DialogClickActionEvent, EventData, EventHandler, ExtensionEvent, ExtensionEventHandler,
+        FailureVerdict, HandlerOptions, HandlerPriority, PLUGIN_DISABLE, PlayerChangeWorldEvent,
+        PlayerInteractUnknownEntityEvent, PlayerLeaveEvent, PlayerLocaleChangeEvent,
+        PlayerRespawnEvent,
     },
     events_wit::EntityInteractionAction,
     java_dialog as dialog,
     java_packets::{
         CHeadRot, CRemoveEntities, CSetEntityMetadata, CSetPassengers, CSpawnEntity,
-        CUpdateEntityRot, ClientboundPacket,
+        CUpdateAttributes, CUpdateEntityRot, ClientboundPacket, Property,
     },
     logging::{LogLevel, log},
     permission::{Permission, PermissionDefault, PermissionLevel},
@@ -67,11 +71,15 @@ use strawberry_plugin_api::{
 };
 
 use api::{Request, SkinAsk};
-use model::{Action, Button, CreateError, Kind, Menu, Npc, Place, Skin, Store, Trigger};
+use model::{
+    Action, Button, CreateError, Kind, Menu, Npc, Place, Skin, SkinModel, SkinPatch, Store, Trigger,
+};
 use view::{Candidate, ClickVerdict, Pos, Turn};
 
 const DATA_FILE: &str = "data/npcs.json";
 const ADMIN_NODE: &str = "npc-lite:admin";
+/// Storing or changing a `console` action (it runs with every right): see `dispatch::may_store`.
+const CONSOLE_NODE: &str = "npc-lite:admin.console";
 const PLUGIN_NAME: &str = "npc-lite";
 /// Scans run more often while a player is this much nearer than an NPC's range.
 const NEAR_MARGIN: f64 = 16.0;
@@ -114,7 +122,8 @@ struct Viewer {
     /// The player's handles from the last scan, so the look task needs no lookups. Dropped when
     /// he leaves or is not seen by a scan.
     player: Option<Player>,
-    java: Option<strawberry_plugin_api::JavaPlayer>,
+    /// How his packets are sent: the one path for a Java and a Bedrock viewer (`Sink`).
+    sink: Option<Sink>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -152,6 +161,8 @@ struct State {
     lookups: Vec<Lookup>,
     lookup_task: Option<u32>,
     warned: BTreeSet<String>,
+    /// When each player's click last ran a command (`dispatch::may_run`).
+    commands_run: BTreeMap<Key, u64>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -253,14 +264,69 @@ fn ensure_save(st: &mut State) {
 
 // ---------------------------------------------------------------- packets
 
-fn send(java: &strawberry_plugin_api::JavaPlayer, packet: &ClientboundPacket) {
-    PACKETS.fetch_add(1, Relaxed);
-    java.send_packet(packet);
+/// Where one viewer's packets go. A Java and a Bedrock viewer are sent the same Java packets: a
+/// Bedrock player's go through the engine's `bedrock-player.send-java-packet`, which draws them in
+/// Bedrock's form. No entity of the world is made for either.
+enum Sink {
+    Java(strawberry_plugin_api::JavaPlayer),
+    Bedrock(strawberry_plugin_api::BedrockPlayer),
 }
 
-/// The entity data of an NPC for a viewer of this language: glow, name, silence, and for a player
-/// NPC its skin.
-fn build_meta(npc: &Npc, language: &str) -> Vec<u8> {
+impl Sink {
+    fn of(player: &Player) -> Option<Self> {
+        player
+            .as_java()
+            .map(Sink::Java)
+            .or_else(|| player.as_bedrock().map(Sink::Bedrock))
+    }
+}
+
+/// What a figure's packets are sent through; a test records them instead.
+trait Wire {
+    fn send_packet(&self, packet: &ClientboundPacket) -> std::result::Result<(), String>;
+    /// Whether the engine draws these packets in Bedrock's form, which takes no attribute update.
+    fn is_bedrock(&self) -> bool;
+}
+
+impl Wire for Sink {
+    fn send_packet(&self, packet: &ClientboundPacket) -> std::result::Result<(), String> {
+        match self {
+            Sink::Java(java) => {
+                java.send_packet(packet);
+                Ok(())
+            }
+            Sink::Bedrock(bedrock) => bedrock.send_java_packet(packet),
+        }
+    }
+
+    fn is_bedrock(&self) -> bool {
+        matches!(self, Sink::Bedrock(_))
+    }
+}
+
+static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+fn send(sink: &impl Wire, packet: &ClientboundPacket) {
+    PACKETS.fetch_add(1, Relaxed);
+    if let Err(why) = sink.send_packet(packet) {
+        // The engine names what it has no form for; one line is enough.
+        // (The host's log call does not exist in a unit test: a test that makes a refusal would abort
+        // the whole test binary there.)
+        if REFUSED.fetch_add(1, Relaxed) == 0 && !cfg!(test) {
+            log(
+                LogLevel::Warn,
+                &format!(
+                    "npc-lite: the engine refused a figure packet for a Bedrock player: {why}"
+                ),
+            );
+        }
+    }
+}
+
+/// The entity data of an NPC for a viewer of this language: glow, name, silence, its pose when it
+/// lies, and for a player NPC its skin. `own` is the viewer's own skin, drawn on an NPC with a
+/// viewer skin (`None`: the default skin).
+fn build_meta(npc: &Npc, language: &str, own: Option<&Skin>) -> Vec<u8> {
     let mut meta = wire::Meta::new();
     meta.byte(wire::FLAGS, if npc.glow { wire::FLAG_GLOWING } else { 0 });
     let name = npc
@@ -272,6 +338,10 @@ fn build_meta(npc: &Npc, language: &str) -> Vec<u8> {
         name.is_some() && npc.name_visible,
     );
     meta.boolean(wire::SILENT, true);
+    // Only a lying NPC sends a pose: a standing one keeps the bytes it always had.
+    if npc.lie {
+        meta.pose(wire::POSE, wire::POSE_SLEEPING);
+    }
     if let Kind::Mob(type_name) = &npc.kind
         && npc.baby
         && let Some(index) = wire::baby_index(type_name)
@@ -281,16 +351,24 @@ fn build_meta(npc: &Npc, language: &str) -> Vec<u8> {
     if npc.kind == Kind::Player {
         meta.byte(wire::MANNEQUIN_SKIN_PARTS, wire::ALL_SKIN_PARTS);
         meta.boolean(wire::MANNEQUIN_IMMOVABLE, true);
-        let textures = npc
-            .skin
-            .as_ref()
-            .map(|skin| (skin.value.as_str(), skin.signature.as_deref()));
+        let skin = if npc.viewer_skin {
+            own
+        } else {
+            npc.skin.as_ref()
+        };
+        let textures = skin.map(|skin| (skin.value.as_str(), skin.signature.as_deref()));
+        let patch = npc.skin_patch.as_ref();
         meta.profile(
             wire::MANNEQUIN_PROFILE,
             &wire::Profile {
                 name: None,
                 id: Some(npc.uuid),
                 textures,
+                body: patch.map(|patch| patch.texture.as_str()),
+                model: patch.map(|patch| match patch.model {
+                    SkinModel::Wide => wire::MODEL_WIDE,
+                    SkinModel::Slim => wire::MODEL_SLIM,
+                }),
             },
         );
         meta.optional_component(wire::MANNEQUIN_DESCRIPTION, None);
@@ -298,20 +376,84 @@ fn build_meta(npc: &Npc, language: &str) -> Vec<u8> {
     meta.finish()
 }
 
+/// A viewer's own skin, read from the server the first time one of his scans needs it.
+struct OwnSkin<'a> {
+    player: Option<&'a Player>,
+    read: Option<Option<Skin>>,
+}
+
+impl<'a> OwnSkin<'a> {
+    const fn of(player: &'a Player) -> Self {
+        Self {
+            player: Some(player),
+            read: None,
+        }
+    }
+
+    /// No player to read from (a test): the default skin.
+    #[cfg(test)]
+    const fn nobody() -> Self {
+        Self {
+            player: None,
+            read: None,
+        }
+    }
+
+    /// His skin as the server holds it now (a skin plugin's chosen one too), or `None` for the
+    /// default skin: none, or one outside what the client reads.
+    fn get(&mut self) -> Option<&Skin> {
+        self.read
+            .get_or_insert_with(|| {
+                self.player
+                    .and_then(Player::get_skin)
+                    .map(|skin| Skin {
+                        from: api::VIEWER_SKIN.into(),
+                        value: skin.value,
+                        signature: skin.signature,
+                    })
+                    .filter(model::valid_skin)
+            })
+            .as_ref()
+    }
+}
+
 fn meta_packet(
     npc: &Npc,
     language: &'static str,
     cache: &mut BTreeMap<(u32, &'static str), Vec<u8>>,
+    own: &mut OwnSkin<'_>,
 ) -> ClientboundPacket {
     // One entry for an NPC with one name for every language.
     let language = if npc.names.is_empty() { "" } else { language };
-    let bytes = cache
-        .entry((npc.num, language))
-        .or_insert_with(|| build_meta(npc, language))
-        .clone();
+    let bytes = if npc.viewer_skin && npc.kind == Kind::Player {
+        // Each viewer's own skin: never cached, never sent to anyone else.
+        build_meta(npc, language, own.get())
+    } else {
+        cache
+            .entry((npc.num, language))
+            .or_insert_with(|| build_meta(npc, language, None))
+            .clone()
+    };
     ClientboundPacket::CSetEntityMetadata(CSetEntityMetadata {
         entity_id: npc.entity_id(),
         metadata: bytes,
+    })
+}
+
+/// The size of an NPC that is not the normal one: the `minecraft:scale` attribute, which a packet
+/// entity can only get as an update-attributes packet. `None` for the normal size: the client's
+/// own default is 1, so nothing is sent (an NPC is always sent whole after a change, `Respawn`).
+#[allow(clippy::float_cmp)]
+fn scale_packet(npc: &Npc) -> Option<ClientboundPacket> {
+    (npc.scale != model::DEFAULT_SCALE).then(|| {
+        ClientboundPacket::CUpdateAttributes(CUpdateAttributes {
+            entity_id: npc.entity_id(),
+            properties: vec![Property {
+                id: wire::ATTRIBUTE_SCALE,
+                value: f64::from(npc.scale),
+                modifiers: Vec::new(),
+            }],
+        })
     })
 }
 
@@ -359,17 +501,24 @@ fn seat_packet(npc: &Npc) -> ClientboundPacket {
 
 /// Sends an NPC to one player, with its seat when it sits.
 fn send_npc(
-    java: &strawberry_plugin_api::JavaPlayer,
+    java: &impl Wire,
     npc: &Npc,
     rot: Option<Turn>,
     language: &'static str,
     cache: &mut BTreeMap<(u32, &'static str), Vec<u8>>,
+    own: &mut OwnSkin<'_>,
 ) {
     if npc.sit {
         send(java, &seat_packet(npc));
     }
     send(java, &spawn_packet(npc, rot));
-    send(java, &meta_packet(npc, language, cache));
+    send(java, &meta_packet(npc, language, cache, own));
+    // The engine has no Bedrock form for an attribute update: a Bedrock viewer sees the normal size.
+    if !java.is_bedrock()
+        && let Some(packet) = scale_packet(npc)
+    {
+        send(java, &packet);
+    }
     if npc.sit {
         send(
             java,
@@ -488,8 +637,7 @@ fn run_scan(st: &mut State, server: &Server) -> Option<u64> {
                 reset: true,
                 ..Viewer::default()
             });
-            let Some(java) = viewer.java.take().or_else(|| player.as_java()) else {
-                // A Bedrock player: nothing is sent.
+            let Some(java) = viewer.sink.take().or_else(|| Sink::of(&player)) else {
                 continue;
             };
             seen.insert(key);
@@ -572,9 +720,10 @@ fn run_scan(st: &mut State, server: &Server) -> Option<u64> {
                     &ClientboundPacket::CRemoveEntities(CRemoveEntities { entity_ids: remove }),
                 );
             }
+            let mut own = OwnSkin::of(&player);
             for num in updates {
                 if let Some(npc) = here.iter().find(|n| n.num == num) {
-                    send(&java, &meta_packet(npc, language, meta));
+                    send(&java, &meta_packet(npc, language, meta, &mut own));
                 }
             }
             for num in spawn {
@@ -585,10 +734,10 @@ fn run_scan(st: &mut State, server: &Server) -> Option<u64> {
                     continue;
                 };
                 budget -= 1;
-                send_npc(&java, npc, rot.get(&num).copied(), language, meta);
+                send_npc(&java, npc, rot.get(&num).copied(), language, meta, &mut own);
                 viewer.visible.insert(num);
             }
-            viewer.java = Some(java);
+            viewer.sink = Some(java);
             viewer.player = Some(player);
         }
     }
@@ -610,6 +759,30 @@ fn run_scan(st: &mut State, server: &Server) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------- looking
+
+/// The head and the body turn of one figure, for one viewer: only what changed.
+fn send_turn(sink: &impl Wire, entity_id: i32, turn: Turn, head: bool, body: bool) {
+    if head {
+        send(
+            sink,
+            &ClientboundPacket::CHeadRot(CHeadRot {
+                entity_id,
+                head_yaw: turn.head,
+            }),
+        );
+    }
+    if body {
+        send(
+            sink,
+            &ClientboundPacket::CUpdateEntityRot(CUpdateEntityRot {
+                entity_id,
+                yaw: turn.body,
+                pitch: turn.pitch,
+                on_ground: true,
+            }),
+        );
+    }
+}
 
 /// Turns each looking NPC to the nearest player within [`LOOK_RANGE`], or back to its own
 /// rotation; sends only rotations that changed. Stops itself when nobody is near.
@@ -670,29 +843,10 @@ fn look_run(_server: &Server) {
                     if !viewer.visible.contains(num) {
                         continue;
                     }
-                    let Some(java) = viewer.java.as_ref() else {
+                    let Some(sink) = viewer.sink.as_ref() else {
                         continue;
                     };
-                    if *head {
-                        send(
-                            java,
-                            &ClientboundPacket::CHeadRot(CHeadRot {
-                                entity_id: *entity_id,
-                                head_yaw: turn.head,
-                            }),
-                        );
-                    }
-                    if *body {
-                        send(
-                            java,
-                            &ClientboundPacket::CUpdateEntityRot(CUpdateEntityRot {
-                                entity_id: *entity_id,
-                                yaw: turn.body,
-                                pitch: turn.pitch,
-                                on_ground: true,
-                            }),
-                        );
-                    }
+                    send_turn(sink, *entity_id, *turn, *head, *body);
                 }
             }
         }
@@ -713,29 +867,25 @@ fn fill(text: &str, player: &Player) -> String {
 
 fn run_action(server: &Server, player: &Player, npc_id: &str, action: &Action) {
     match action {
-        Action::Message(text) => {
+        Action::Message { text, texts } => {
+            // The player's language is read only for a message that has lines per language.
+            let line = if texts.is_empty() {
+                text.as_str()
+            } else {
+                model::line_for(text, texts, lang::language(&player.get_locale()))
+            };
             player.send_system_message(
-                TextComponent::from_legacy_string_with_code(&fill(text, player), '&'),
+                TextComponent::from_legacy_string_with_code(&fill(line, player), '&'),
                 false,
             );
         }
         Action::Command(command) | Action::Console(command) => {
-            let runner = if matches!(action, Action::Command(_)) {
-                dispatch::Runner::Player(player)
-            } else {
-                dispatch::Runner::Console
-            };
-            if dispatch::run(runner, &fill(command, player)).is_err() {
-                let first = with(|st| st.warned.insert(npc_id.to_string()));
-                if first {
-                    log(
-                        LogLevel::Warn,
-                        &format!(
-                            "npc-lite: NPC {npc_id} has a command action, and this server cannot run commands for plugins yet; it is skipped"
-                        ),
-                    );
-                }
-            }
+            run_click_command(
+                npc_id,
+                player,
+                command,
+                matches!(action, Action::Console(_)),
+            );
         }
         Action::Teleport(place) => {
             if let Some(world) = server.get_world_by_name(&place.world) {
@@ -748,7 +898,102 @@ fn run_action(server: &Server, player: &Player, npc_id: &str, action: &Action) {
             }
         }
         Action::Menu(name) => open_menu(player, name),
+        Action::Ui(file) => open_ui(npc_id, player, file),
     }
+}
+
+/// A `command` or `console` action of a click. `dispatch::prepare`
+/// decides what runs and refuses on any doubt; the line then runs on the next tick, never inside
+/// the click, and only for a player who is still there. At most one command per player in
+/// `dispatch::COMMAND_GAP_MS`. A refusal is told to the server's log once per NPC.
+fn run_click_command(npc_id: &str, player: &Player, command: &str, console: bool) {
+    let run = match dispatch::prepare(console, command, &player.get_name()) {
+        Ok(run) => run,
+        Err(why) => {
+            if with(|st| st.warned.insert(npc_id.to_string())) {
+                log(
+                    LogLevel::Warn,
+                    &format!(
+                        "npc-lite: NPC {npc_id} has a command action that ran nothing ({why:?}); it is refused"
+                    ),
+                );
+            }
+            return;
+        }
+    };
+    let key = key_of(&player.get_id());
+    let now = now_ms();
+    let allowed = with(|st| {
+        if dispatch::may_run(st.commands_run.get(&key).copied(), now) {
+            st.commands_run.insert(key, now);
+            true
+        } else {
+            false
+        }
+    });
+    if !allowed {
+        return;
+    }
+    strawberry_plugin_api::scheduler::schedule_delayed_task(1, move |server| {
+        if let Some(player) = server.get_player_by_uuid(uuid_of(key)) {
+            dispatch::execute(&server, &player, &run);
+        }
+    });
+}
+
+/// The note a saved command action is followed by: who runs it, and that a console action has
+/// every right.
+fn saved_note(action: &Action) -> Option<&'static str> {
+    match action {
+        Action::Command(_) => Some("command_saved"),
+        Action::Console(_) => Some("console_saved"),
+        _ => None,
+    }
+}
+
+/// The plugin that shows the server's own menu files.
+const UI_PLUGIN: &str = "user_interface";
+
+/// Asks `user_interface` to open the server's file `file` for the player who clicked, as its own
+/// command would (`open_file`). That plugin decides: only a file the server owner gave a command,
+/// key or item, only for a player with its menu right, at most two a second. On the next tick, so
+/// no plugin waits on another inside a click. A refusal is told to the server's log once per NPC.
+fn open_ui(npc_id: &str, player: &Player, file: &str) {
+    let ask = serde_json::json!({
+        "op": "open_file",
+        "player": wire::uuid_string(key_of(&player.get_id())),
+        "file": file,
+    })
+    .to_string()
+    .into_bytes();
+    let npc_id = npc_id.to_string();
+    strawberry_plugin_api::scheduler::schedule_delayed_task(1, move |_server| {
+        let answer =
+            strawberry_plugin_api::wit::strawberry::plugin::ipc::send_ipc_message(UI_PLUGIN, &ask);
+        let why = match answer {
+            Ok(Ok(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(reply) if reply.get("ok") == Some(&serde_json::Value::Bool(true)) => return,
+                Ok(reply) => reply
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("refused")
+                    .to_string(),
+                Err(_) => "an answer that is not JSON".to_string(),
+            },
+            Ok(Err(why)) => why,
+            Err(()) => "the user_interface plugin is not on this server".to_string(),
+        };
+        // A busy player (a menu opened a moment ago) is not the server owner's to fix.
+        if why.starts_with("busy:") || why == "player not online" {
+            return;
+        }
+        if with(|st| st.warned.insert(npc_id.clone())) {
+            log(
+                LogLevel::Warn,
+                &format!("npc-lite: NPC {npc_id} has a ui action that opened nothing: {why}"),
+            );
+        }
+    });
 }
 
 fn open_menu(player: &Player, name: &str) {
@@ -841,8 +1086,9 @@ fn click(server: &Server, player: &Player, entity_id: i32, left: bool) {
     };
     let now = now_ms();
     let chosen = with(|st| {
-        // A plugin's NPC: the plugin listens to this event itself and asks.
-        if st.store.by_num(num)?.owner.is_some() {
+        // A plugin's NPC without actions: the plugin listens to this event itself and asks.
+        let npc = st.store.by_num(num)?;
+        if npc.owner.is_some() && npc.actions.is_empty() {
             return None;
         }
         let verdict = check_click(st, num, &who, now)?;
@@ -887,6 +1133,11 @@ impl EventHandler<PlayerInteractUnknownEntityEvent> for Click {
         server: Server,
         event: EventData<PlayerInteractUnknownEntityEvent>,
     ) -> EventData<PlayerInteractUnknownEntityEvent> {
+        // A click another plugin refused (a login or protection script, or a page open over the
+        // world) runs nothing: an action may open a menu whose buttons run console commands.
+        if event.cancelled {
+            return event;
+        }
         click(
             &server,
             &event.player,
@@ -895,6 +1146,40 @@ impl EventHandler<PlayerInteractUnknownEntityEvent> for Click {
         );
         event
     }
+}
+
+/// A script was disabled, unloaded or reloaded: the figures it asked for that live in memory only
+/// go with it (`persist: true` ones stay). Only on this event, nothing per tick.
+struct ScriptDisabled;
+
+impl ExtensionEventHandler for ScriptDisabled {
+    fn handle(&self, _server: Server, event: &ExtensionEvent) {
+        let Some(plugin) = event.plugin_name() else {
+            return;
+        };
+        // npc-lite's own unload is `on_unload`'s.
+        if plugin == PLUGIN_NAME {
+            return;
+        }
+        with(|st| forget_memory_only_of(st, &plugin));
+    }
+}
+
+/// Takes the memory-only figures of the script `owner` from the store and, at the next scan, from
+/// every player who has them. How many.
+fn forget_memory_only_of(st: &mut State, owner: &str) -> usize {
+    let gone = st.store.remove_memory_only_of(owner);
+    if gone.is_empty() {
+        return 0;
+    }
+    for (id, num) in &gone {
+        st.removed.insert(*num);
+        forget_meta(&mut st.meta, *num);
+        st.rot.remove(num);
+        st.lookups.retain(|l| &l.npc != id);
+    }
+    ensure_scan(st, true);
+    gone.len()
 }
 
 struct MenuClick;
@@ -944,6 +1229,7 @@ impl EventHandler<PlayerLeaveEvent> for Leave {
         with(|st| {
             st.viewers.remove(&key);
             st.look_near.remove(&key);
+            st.commands_run.remove(&key);
         });
         event
     }
@@ -1052,6 +1338,7 @@ fn poll_lookups(server: &Server) {
                         "skin_not_found"
                     } else if let Some(npc) = st.store.npcs.get_mut(&npc_id) {
                         npc.skin = Some(skin);
+                        npc.viewer_skin = false;
                         let num = npc.num;
                         changed(st, num, Refresh::Meta);
                         "skin_set"
@@ -1128,6 +1415,18 @@ fn flag(args: &ConsumedArgs, name: &str) -> Option<bool> {
     }
 }
 
+/// The `size` of `/npc scale`: a number of any width, as the game's attribute holds it.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn size_arg(args: &ConsumedArgs) -> Option<f32> {
+    match args.get_value("size") {
+        Arg::Num(Ok(Number::Float64(v))) => Some(v as f32),
+        Arg::Num(Ok(Number::Float32(v))) => Some(v),
+        Arg::Num(Ok(Number::Int32(v))) => Some(v as f32),
+        Arg::Num(Ok(Number::Int64(v))) => Some(v as f32),
+        _ => None,
+    }
+}
+
 fn index(args: &ConsumedArgs, name: &str) -> Option<usize> {
     match args.get_value(name) {
         Arg::Num(Ok(Number::Int32(value))) => usize::try_from(value).ok(),
@@ -1161,6 +1460,8 @@ enum Op {
     NameClear,
     Skin,
     SkinClear,
+    Texture,
+    TextureClear,
     Type,
     Glow,
     Look,
@@ -1180,9 +1481,11 @@ enum Op {
     Stats,
     Cooldown,
     Range,
+    Scale,
     Baby,
     NameVisible,
     Sit,
+    Lie,
     NameFor,
     NameForClear,
     Import,
@@ -1224,6 +1527,7 @@ fn run_command(
                 "usage_edit",
                 "usage_view",
                 "usage_action",
+                "usage_console",
                 "usage_menu",
                 "usage_other",
             ] {
@@ -1360,8 +1664,17 @@ fn info(sender: &CommandSender, language: &str, id: &str) -> Reply {
     }
     if npc.kind == Kind::Player {
         match &npc.skin {
+            _ if npc.viewer_skin => say(sender, language, "info_viewer_skin", &[]),
             Some(skin) => say(sender, language, "info_skin", &[&skin.from]),
             None => say(sender, language, "info_default_skin", &[]),
+        }
+        if let Some(patch) = &npc.skin_patch {
+            say(
+                sender,
+                language,
+                "info_texture",
+                &[&patch.texture, model::model_name(patch.model)],
+            );
         }
     }
     say(
@@ -1373,6 +1686,7 @@ fn info(sender: &CommandSender, language: &str, id: &str) -> Reply {
             &yes_no(language, npc.look),
             &yes_no(language, npc.baby),
             &yes_no(language, npc.sit),
+            &yes_no(language, npc.lie),
         ],
     );
     say(
@@ -1381,6 +1695,9 @@ fn info(sender: &CommandSender, language: &str, id: &str) -> Reply {
         "info_view",
         &[&npc.range.to_string(), &npc.cooldown_ms.to_string()],
     );
+    if (npc.scale - model::DEFAULT_SCALE).abs() > f32::EPSILON {
+        say(sender, language, "info_scale", &[&npc.scale.to_string()]);
+    }
     match &npc.permission {
         Some(node) => say(sender, language, "info_permission", &[node]),
         None => say(sender, language, "info_everyone", &[]),
@@ -1481,7 +1798,7 @@ fn edit(
             say(sender, language, "removed", &[id]);
             Ok(1)
         }
-        Op::Import => run_import(sender, language),
+        Op::Import => run_import(sender, language, console_right(sender, server)),
         Op::MenuCreate => {
             let menu_name = word(args, "menu").unwrap_or_default();
             let title = word(args, "title").unwrap_or_default();
@@ -1578,9 +1895,10 @@ fn edit(
             let menu_name = word(args, "menu").unwrap_or_default();
             let number = index(args, "index").unwrap_or(0);
             let here = player.as_ref().map(place_of);
-            let action = parse_action_args(args, here.as_ref(), language)?;
+            let action =
+                parse_action_args(args, here.as_ref(), language, console_right(sender, server))?;
             let shown = model::action_text(&action);
-            let is_command = matches!(action, Action::Command(_) | Action::Console(_));
+            let saved = saved_note(&action);
             let result = with(|st| {
                 let menu = st.store.menus.get_mut(&menu_name).ok_or("menu_unknown")?;
                 let button = number
@@ -1599,8 +1917,8 @@ fn edit(
                         "button_action",
                         &[&menu_name, &number.to_string(), &shown],
                     );
-                    if is_command {
-                        say(sender, language, "command_saved", &[]);
+                    if let Some(key) = saved {
+                        say(sender, language, key, &[]);
                     }
                     Ok(1)
                 }
@@ -1639,7 +1957,7 @@ fn dropped_text(language: &str, what: &import::Dropped) -> String {
 
 /// `/npc import`: every row of `data/import.yml` that has no NPC of its name yet becomes one. One
 /// bounded read on request, then the normal save off the tick.
-fn run_import(sender: &CommandSender, language: &str) -> Reply {
+fn run_import(sender: &CommandSender, language: &str, console_right: bool) -> Reply {
     match std::fs::metadata(IMPORT_FILE) {
         Err(_) => return Err(fail(language, "import_missing", &[])),
         Ok(meta) if meta.len() > import::MAX_IMPORT as u64 => {
@@ -1651,10 +1969,13 @@ fn run_import(sender: &CommandSender, language: &str) -> Reply {
         }
         Ok(_) => {}
     }
-    let report = std::fs::read_to_string(IMPORT_FILE)
+    let mut report = std::fs::read_to_string(IMPORT_FILE)
         .map_err(|e| e.to_string())
         .and_then(|text| import::read_saves(&text))
         .map_err(|reason| fail(language, "import_bad", &[&reason]))?;
+    if !console_right {
+        import::drop_console_actions(&mut report.rows);
+    }
     let mut lines: Vec<String> = report
         .skipped
         .iter()
@@ -1739,21 +2060,52 @@ fn run_import(sender: &CommandSender, language: &str) -> Reply {
     Ok(made)
 }
 
+/// Whether the sender may store or change a `console` action (`dispatch::may_store`).
+fn console_right(sender: &CommandSender, server: &Server) -> bool {
+    sender.is_console() || sender.has_permission(server, CONSOLE_NODE)
+}
+
 fn parse_action_args(
     args: &ConsumedArgs,
     here: Option<&Place>,
     language: &str,
+    console_right: bool,
 ) -> std::result::Result<Action, CommandError> {
     let kind = word(args, "kind").unwrap_or_default();
     let value = word(args, "value").unwrap_or_default();
-    model::parse_action(&kind, &value, here).map_err(|e| match e {
+    let action = model::parse_action(&kind, &value, here).map_err(|e| match e {
         model::ActionError::UnknownType => fail(language, "bad_action_type", &[]),
         model::ActionError::BadText => {
             fail(language, "bad_text", &[&model::MAX_MESSAGE.to_string()])
         }
         model::ActionError::BadPlace => fail(language, "bad_place", &[]),
         model::ActionError::BadMenu => fail(language, "menu_unknown", &[&value]),
-    })
+        model::ActionError::BadUi => fail(language, "bad_ui", &[]),
+    })?;
+    if !dispatch::may_store(matches!(action, Action::Console(_)), console_right) {
+        return Err(fail(language, "console_right", &[CONSOLE_NODE]));
+    }
+    // A stored command is judged when it is made, so the server owner is told at once; it is
+    // judged again at every click.
+    let stored = match &action {
+        Action::Command(command) => Some((command.as_str(), false)),
+        Action::Console(command) => Some((command.as_str(), true)),
+        _ => None,
+    };
+    if let Some((command, console)) = stored {
+        dispatch::check_stored(console, command).map_err(|why| {
+            let root = command_rules::root(command).unwrap_or_default();
+            match why {
+                dispatch::Refused::Platform => fail(language, "command_platform", &[&root]),
+                dispatch::Refused::ForbiddenFromConsole => {
+                    fail(language, "command_console", &[&root])
+                }
+                dispatch::Refused::NoPlainName => fail(language, "command_name", &[]),
+                _ => fail(language, "bad_text", &[&model::MAX_COMMAND.to_string()]),
+            }
+        })?;
+    }
+    Ok(action)
 }
 
 #[expect(clippy::too_many_lines, reason = "one arm per subcommand")]
@@ -1862,19 +2214,53 @@ fn edit_npc(
                 ))
             })
         }
-        Op::Sit => {
+        Op::Sit | Op::Lie => {
             let value = flag(args, "value").unwrap_or(false);
+            let sit = matches!(op, Op::Sit);
             apply(&|npc| {
-                npc.sit = value;
-                Ok((
-                    Some(Refresh::Respawn),
-                    if value { "sit_on" } else { "sit_off" },
-                    vec![id_text.clone()],
-                ))
+                // An NPC sits or lies, not both: the other one goes off first.
+                if value && (if sit { npc.lie } else { npc.sit }) {
+                    return Err(fail(language, "sit_and_lie", &[&id_text]));
+                }
+                if sit {
+                    npc.sit = value;
+                } else {
+                    npc.lie = value;
+                }
+                let key = match (sit, value) {
+                    (true, true) => "sit_on",
+                    (true, false) => "sit_off",
+                    (false, true) => "lie_on",
+                    (false, false) => "lie_off",
+                };
+                // Sent again whole: entity data that leaves the pose out would not make a lying
+                // NPC stand up on a client that has it.
+                Ok((Some(Refresh::Respawn), key, vec![id_text.clone()]))
             })
         }
         Op::Skin => {
             let account = word(args, "account").unwrap_or_default();
+            if account == api::VIEWER_SKIN {
+                if with(|st| {
+                    st.store
+                        .npcs
+                        .get(id)
+                        .is_some_and(|n| n.kind != Kind::Player)
+                }) {
+                    return Err(fail(language, "skin_players_only", &[]));
+                }
+                // A lookup still running for this NPC would put an account's skin over it.
+                with(|st| st.lookups.retain(|l| l.npc != id));
+                return apply(&|npc| {
+                    npc.viewer_skin = true;
+                    npc.skin = None;
+                    Ok((
+                        Some(Refresh::Meta),
+                        "skin_viewer_set",
+                        vec![id_text.clone()],
+                    ))
+                });
+            }
             if !model::valid_account(&account) {
                 return Err(fail(language, "bad_account", &[]));
             }
@@ -1900,6 +2286,7 @@ fn edit_npc(
                 if model::valid_skin(&skin) {
                     return apply(&|npc| {
                         npc.skin = Some(skin.clone());
+                        npc.viewer_skin = false;
                         Ok((
                             Some(Refresh::Meta),
                             "skin_set",
@@ -1924,7 +2311,52 @@ fn edit_npc(
         }
         Op::SkinClear => apply(&|npc| {
             npc.skin = None;
+            npc.viewer_skin = false;
             Ok((Some(Refresh::Meta), "skin_cleared", vec![id_text.clone()]))
+        }),
+        Op::Texture => {
+            // `namespace:path`, then `wide` or `slim` if wanted.
+            let text = word(args, "texture").unwrap_or_default();
+            let mut words = text.split_whitespace();
+            let texture = words.next().unwrap_or_default().to_string();
+            let model = words
+                .next()
+                .map_or(Some(SkinModel::Wide), model::parse_model);
+            let (Some(model), None, true) = (model, words.next(), model::valid_texture(&texture))
+            else {
+                return Err(fail(language, "bad_texture", &[]));
+            };
+            if with(|st| {
+                st.store
+                    .npcs
+                    .get(id)
+                    .is_some_and(|n| n.kind != Kind::Player)
+            }) {
+                return Err(fail(language, "skin_players_only", &[]));
+            }
+            apply(&|npc| {
+                npc.skin_patch = Some(SkinPatch {
+                    texture: texture.clone(),
+                    model,
+                });
+                Ok((
+                    Some(Refresh::Meta),
+                    "texture_set",
+                    vec![
+                        id_text.clone(),
+                        texture.clone(),
+                        model::model_name(model).to_string(),
+                    ],
+                ))
+            })
+        }
+        Op::TextureClear => apply(&|npc| {
+            npc.skin_patch = None;
+            Ok((
+                Some(Refresh::Meta),
+                "texture_cleared",
+                vec![id_text.clone()],
+            ))
         }),
         Op::Type => {
             let type_name = word(args, "type").unwrap_or_default();
@@ -1967,6 +2399,25 @@ fn edit_npc(
             apply(&|npc| {
                 npc.range = blocks;
                 Ok((None, "range_set", vec![id_text.clone(), blocks.to_string()]))
+            })
+        }
+        Op::Scale => {
+            let size = size_arg(args);
+            let Some(size) = size.filter(|size| model::valid_scale(*size)) else {
+                return Err(fail(
+                    language,
+                    "bad_scale",
+                    &[&model::MIN_SCALE.to_string(), &model::MAX_SCALE.to_string()],
+                ));
+            };
+            apply(&|npc| {
+                npc.scale = size;
+                // Sent again whole: a client that has the NPC keeps no other way to go back to 1.
+                Ok((
+                    Some(Refresh::Respawn),
+                    "scale_set",
+                    vec![id_text.clone(), size.to_string()],
+                ))
             })
         }
         Op::Baby => {
@@ -2073,8 +2524,9 @@ fn edit_npc(
                 return Err(fail(language, "bad_trigger", &[]));
             };
             let here = player.map(place_of);
-            let action = parse_action_args(args, here.as_ref(), language)?;
-            let is_command = matches!(action, Action::Command(_) | Action::Console(_));
+            let action =
+                parse_action_args(args, here.as_ref(), language, console_right(sender, server))?;
+            let saved = saved_note(&action);
             let reply = apply(&|npc| {
                 if npc.actions.len() >= model::MAX_ACTIONS {
                     return Err(fail(
@@ -2090,8 +2542,8 @@ fn edit_npc(
                     vec![id_text.clone(), npc.actions.len().to_string()],
                 ))
             })?;
-            if is_command {
-                say(sender, language, "command_saved", &[]);
+            if let Some(key) = saved {
+                say(sender, language, key, &[]);
             }
             Ok(reply)
         }
@@ -2168,10 +2620,20 @@ fn npc_command() -> Command {
         .then(CommandNode::literal("sit").then(
             id().then(CommandNode::argument("value", &ArgumentType::Bool).execute(Cmd(Op::Sit))),
         ))
+        .then(CommandNode::literal("lie").then(
+            id().then(CommandNode::argument("value", &ArgumentType::Bool).execute(Cmd(Op::Lie))),
+        ))
         .then(
             CommandNode::literal("skin").then(
                 id().execute(Cmd(Op::SkinClear))
                     .then(word_arg("account").execute(Cmd(Op::Skin))),
+            ),
+        )
+        .then(
+            // A texture has `:` and `/`, which one command word does not take.
+            CommandNode::literal("texture").then(
+                id().execute(Cmd(Op::TextureClear))
+                    .then(greedy_arg("texture").execute(Cmd(Op::Texture))),
             ),
         )
         .then(CommandNode::literal("type").then(id().then(word_arg("type").execute(Cmd(Op::Type)))))
@@ -2181,6 +2643,20 @@ fn npc_command() -> Command {
         .then(CommandNode::literal("look").then(
             id().then(CommandNode::argument("value", &ArgumentType::Bool).execute(Cmd(Op::Look))),
         ))
+        .then(
+            CommandNode::literal("scale").then(
+                id().then(
+                    CommandNode::argument(
+                        "size",
+                        &ArgumentType::Double((
+                            Some(f64::from(model::MIN_SCALE)),
+                            Some(f64::from(model::MAX_SCALE)),
+                        )),
+                    )
+                    .execute(Cmd(Op::Scale)),
+                ),
+            ),
+        )
         .then(CommandNode::literal("baby").then(
             id().then(CommandNode::argument("value", &ArgumentType::Bool).execute(Cmd(Op::Baby))),
         ))
@@ -2343,7 +2819,7 @@ fn api_run(
 ) -> std::result::Result<serde_json::Value, String> {
     use serde_json::json;
     match request {
-        Request::Create { key, spec, skin } => api_create(st, from, &key, spec, skin),
+        Request::Create { key, spec, skin } => api_create(st, from, &key, *spec, skin),
         Request::Move { key, place } => {
             let id = model::owned_id(from, &key);
             let (num, persist) = owned(st, &id, &key)?;
@@ -2423,6 +2899,10 @@ fn api_create(
     let id = model::owned_id(from, key);
     let account = match skin {
         SkinAsk::None => None,
+        SkinAsk::Viewer => {
+            spec.viewer_skin = true;
+            None
+        }
         SkinAsk::Given(skin) => {
             spec.skin = Some(skin);
             None
@@ -2492,14 +2972,18 @@ fn api_click(
     let Some(num) = model::num_of(entity_id) else {
         return refused;
     };
-    let Some(key) = st
+    let Some((key, has_actions)) = st
         .store
         .by_num(num)
         .filter(|npc| npc.owner.as_deref() == Some(from))
-        .map(|npc| npc.key().to_string())
+        .map(|npc| (npc.key().to_string(), !npc.actions.is_empty()))
     else {
         return refused;
     };
+    // Its clicks run its actions here; an answer as well would count one click twice.
+    if has_actions {
+        return json!({"accepted": false, "reason": "npc-lite runs this NPC's actions itself"});
+    }
     let who = st
         .server
         .as_ref()
@@ -2580,6 +3064,12 @@ impl Plugin for NpcLite {
             default: PermissionDefault::Op(PermissionLevel::Two),
             children: vec![],
         })?;
+        context.register_permission(&Permission {
+            node: CONSOLE_NODE.into(),
+            description: "Store an NPC action the console runs, with every right".into(),
+            default: PermissionDefault::Op(PermissionLevel::Four),
+            children: vec![],
+        })?;
         context.register_command(npc_command(), ADMIN_NODE);
         context.register_event_handler_with_options::<PlayerInteractUnknownEntityEvent, _>(
             Click,
@@ -2600,6 +3090,15 @@ impl Plugin for NpcLite {
             LocaleChange,
             observer(),
         )?;
+        // Blocking, so no unload of a script is missed while the server is busy.
+        context.register_extension_event_handler(
+            PLUGIN_DISABLE,
+            ScriptDisabled,
+            HandlerOptions {
+                blocking: true,
+                ..observer()
+            },
+        )?;
         Ok(())
     }
 
@@ -2618,7 +3117,7 @@ impl Plugin for NpcLite {
                 }
                 if let Some(java) = server
                     .get_player_by_uuid(uuid_of(*key))
-                    .and_then(|p| p.as_java())
+                    .and_then(|p| Sink::of(&p))
                 {
                     let mut entity_ids = Vec::with_capacity(viewer.visible.len() * 2);
                     for num in &viewer.visible {
@@ -2645,3 +3144,261 @@ impl Plugin for NpcLite {
 }
 
 register_plugin!(NpcLite);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nameless(kind: &str) -> Npc {
+        let mut store = model::Store::default();
+        let place = Place {
+            world: "w".into(),
+            x: 0.5,
+            y: 64.0,
+            z: 0.5,
+            yaw: 90.0,
+            pitch: 0.0,
+        };
+        let kind = model::parse_kind(kind).unwrap();
+        let mut npc = store
+            .create("sleeper", kind, place, (1, 2))
+            .unwrap()
+            .clone();
+        // No name: building the name's text component needs the server.
+        npc.name = None;
+        npc
+    }
+
+    /// Shared flags (no glow), no custom name, its name not shown, silent.
+    const STANDING_HEAD: [u8; 12] = [0, 0, 0, 2, 6, 0, 3, 8, 0, 4, 8, 1];
+    /// The pose entry: index 6, the pose serializer (20), SLEEPING (2).
+    const SLEEPING: [u8; 3] = [6, 20, 2];
+
+    #[test]
+    fn a_lying_mob_sends_the_sleeping_pose_and_a_standing_one_sends_what_it_always_did() {
+        let mut npc = nameless("minecraft:zombie");
+        let standing = build_meta(&npc, "en", None);
+        let mut before = STANDING_HEAD.to_vec();
+        before.push(0xFF);
+        assert_eq!(standing, before, "a standing NPC's bytes do not change");
+        npc.lie = true;
+        let mut lying = STANDING_HEAD.to_vec();
+        lying.extend_from_slice(&SLEEPING);
+        lying.push(0xFF);
+        assert_eq!(build_meta(&npc, "en", None), lying);
+    }
+
+    #[test]
+    fn a_lying_mannequin_sends_the_sleeping_pose_beside_its_skin() {
+        let mut npc = nameless("player");
+        let standing = build_meta(&npc, "en", None);
+        assert!(standing.starts_with(&STANDING_HEAD));
+        assert!(!standing.windows(3).any(|w| w == SLEEPING));
+        npc.lie = true;
+        let lying = build_meta(&npc, "en", None);
+        let mut expected = STANDING_HEAD.to_vec();
+        expected.extend_from_slice(&SLEEPING);
+        expected.extend_from_slice(&standing[STANDING_HEAD.len()..]);
+        assert_eq!(lying, expected);
+    }
+
+    /// A larger NPC is sent its size as the game's scale attribute (so that the client draws it from
+    /// farther away); a normal one is sent nothing, as before.
+    #[test]
+    fn a_scaled_npc_is_sent_the_scale_attribute_and_a_normal_one_nothing() {
+        let mut npc = nameless("player");
+        assert!(scale_packet(&npc).is_none());
+        npc.scale = 3.0;
+        let Some(ClientboundPacket::CUpdateAttributes(packet)) = scale_packet(&npc) else {
+            panic!("a scaled NPC is sent an update-attributes packet");
+        };
+        assert_eq!(packet.entity_id, npc.entity_id());
+        assert_eq!(packet.properties.len(), 1);
+        assert_eq!(packet.properties[0].id, 30, "minecraft:scale");
+        assert!((packet.properties[0].value - 3.0).abs() < f64::EPSILON);
+        assert!(packet.properties[0].modifiers.is_empty());
+    }
+
+    /// Records what a viewer is sent, as the one path does for a Java and a Bedrock viewer.
+    struct Recorder {
+        bedrock: bool,
+        refuse_attributes: bool,
+        sent: std::cell::RefCell<Vec<ClientboundPacket>>,
+    }
+
+    impl Recorder {
+        fn new(bedrock: bool) -> Self {
+            Self {
+                bedrock,
+                refuse_attributes: bedrock,
+                sent: std::cell::RefCell::default(),
+            }
+        }
+    }
+
+    impl Wire for Recorder {
+        fn send_packet(&self, packet: &ClientboundPacket) -> std::result::Result<(), String> {
+            self.sent.borrow_mut().push(packet.clone());
+            if self.refuse_attributes && matches!(packet, ClientboundPacket::CUpdateAttributes(_)) {
+                return Err("has no Bedrock form here".into());
+            }
+            Ok(())
+        }
+
+        fn is_bedrock(&self) -> bool {
+            self.bedrock
+        }
+    }
+
+    fn names(sent: &[ClientboundPacket]) -> Vec<&'static str> {
+        sent.iter()
+            .map(|p| match p {
+                ClientboundPacket::CSpawnEntity(_) => "spawn",
+                ClientboundPacket::CSetEntityMetadata(_) => "data",
+                ClientboundPacket::CSetPassengers(_) => "passengers",
+                ClientboundPacket::CUpdateAttributes(_) => "attributes",
+                ClientboundPacket::CHeadRot(_) => "head",
+                ClientboundPacket::CUpdateEntityRot(_) => "turn",
+                ClientboundPacket::CRemoveEntities(_) => "remove",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    fn dump(sent: &[ClientboundPacket]) -> String {
+        format!("{sent:?}")
+    }
+
+    fn shown(npc: &Npc, viewer: &Recorder) -> Vec<ClientboundPacket> {
+        let mut cache = BTreeMap::new();
+        send_npc(viewer, npc, None, "en", &mut cache, &mut OwnSkin::nobody());
+        viewer.sent.borrow().clone()
+    }
+
+    /// A Bedrock viewer is sent a figure the way a Java viewer is: the same packets in the same
+    /// order through the engine call (nothing of the world is made for him). Only the size, an
+    /// attribute update the engine has no Bedrock form for, is left out, and nothing is sent for it.
+    #[test]
+    fn a_bedrock_viewer_is_sent_the_same_figure_packets_as_a_java_viewer() {
+        for kind in ["player", "minecraft:zombie"] {
+            let mut npc = nameless(kind);
+            let java = shown(&npc, &Recorder::new(false));
+            let bedrock = shown(&npc, &Recorder::new(true));
+            assert_eq!(names(&java), ["spawn", "data"], "{kind}");
+            assert_eq!(names(&bedrock), names(&java), "{kind}");
+            assert_eq!(
+                dump(&bedrock),
+                dump(&java),
+                "{kind}: the same packets, byte for byte"
+            );
+            npc.scale = 2.0;
+            assert_eq!(
+                names(&shown(&npc, &Recorder::new(false))),
+                ["spawn", "data", "attributes"]
+            );
+            let recorder = Recorder::new(true);
+            assert_eq!(names(&shown(&npc, &recorder)), ["spawn", "data"]);
+            assert!(
+                !recorder
+                    .sent
+                    .borrow()
+                    .iter()
+                    .any(|p| matches!(p, ClientboundPacket::CUpdateAttributes(_))),
+                "an attribute update is never sent to a Bedrock viewer"
+            );
+        }
+    }
+
+    /// A sitting figure reaches a Bedrock viewer with its seat and the ride link, as for Java.
+    #[test]
+    fn a_sitting_figure_reaches_a_bedrock_viewer_with_its_seat() {
+        for kind in ["player", "minecraft:zombie"] {
+            let mut npc = nameless(kind);
+            npc.sit = true;
+            let java = shown(&npc, &Recorder::new(false));
+            let bedrock = shown(&npc, &Recorder::new(true));
+            assert_eq!(
+                names(&bedrock),
+                ["spawn", "spawn", "data", "passengers"],
+                "{kind}"
+            );
+            assert_eq!(dump(&bedrock), dump(&java), "{kind}");
+            let ClientboundPacket::CSetPassengers(link) = &bedrock[3] else {
+                panic!("the ride link comes last");
+            };
+            assert_eq!(link.entity_id, npc.seat_id());
+            assert_eq!(link.passengers, vec![npc.entity_id()]);
+        }
+    }
+
+    /// Turning to the nearest player sends a Bedrock viewer the head and body turns that changed.
+    #[test]
+    fn a_figure_turns_to_a_bedrock_viewer_with_the_packets_a_java_viewer_gets() {
+        let turn = Turn {
+            head: 10,
+            body: 20,
+            pitch: 30,
+        };
+        for (head, body, expect) in [
+            (true, true, vec!["head", "turn"]),
+            (true, false, vec!["head"]),
+            (false, true, vec!["turn"]),
+            (false, false, vec![]),
+        ] {
+            let java = Recorder::new(false);
+            let bedrock = Recorder::new(true);
+            send_turn(&java, 77, turn, head, body);
+            send_turn(&bedrock, 77, turn, head, body);
+            assert_eq!(names(&bedrock.sent.borrow()), expect);
+            assert_eq!(dump(&bedrock.sent.borrow()), dump(&java.sent.borrow()));
+        }
+    }
+
+    /// A packet the engine refuses does not stop the rest of the figure from being sent.
+    #[test]
+    fn a_refused_packet_does_not_stop_the_figure_reaching_a_bedrock_viewer() {
+        let mut npc = nameless("player");
+        npc.scale = 2.0;
+        npc.sit = true;
+        let viewer = Recorder::new(true);
+        viewer.sent.borrow_mut().clear();
+        // Refused at the engine: sent anyway when forced through `send`.
+        send(&viewer, &scale_packet(&npc).unwrap());
+        let rest = shown(&npc, &viewer);
+        assert_eq!(names(&rest[1..]), ["spawn", "spawn", "data", "passengers"]);
+    }
+
+    fn has(bytes: &[u8], part: &str) -> bool {
+        bytes.windows(part.len()).any(|w| w == part.as_bytes())
+    }
+
+    #[test]
+    fn a_viewer_skin_npc_wears_the_viewers_own_skin_and_no_one_elses() {
+        let alex = Skin {
+            from: api::VIEWER_SKIN.into(),
+            value: "QUxFWA==".into(),
+            signature: Some("c2lnLWFsZXg=".into()),
+        };
+        let steve = Skin {
+            from: "Steve".into(),
+            value: "U1RFVkU=".into(),
+            signature: None,
+        };
+        let mut npc = nameless("player");
+        npc.skin = Some(steve.clone());
+        // Without the viewer skin the NPC's own skin is drawn; a viewer's is never used.
+        let own = build_meta(&npc, "en", Some(&alex));
+        assert!(has(&own, &steve.value) && !has(&own, &alex.value));
+        npc.viewer_skin = true;
+        let for_alex = build_meta(&npc, "en", Some(&alex));
+        assert!(has(&for_alex, &alex.value) && has(&for_alex, "c2lnLWFsZXg="));
+        assert!(!has(&for_alex, &steve.value), "only the viewer's own skin");
+        // A viewer with no skin sees the default one: no textures at all.
+        let plain = build_meta(&npc, "en", None);
+        assert!(!has(&plain, &steve.value) && !has(&plain, "textures"));
+        // A mob never draws a skin.
+        let mut zombie = nameless("minecraft:zombie");
+        zombie.viewer_skin = true;
+        assert!(!has(&build_meta(&zombie, "en", Some(&alex)), &alex.value));
+    }
+}

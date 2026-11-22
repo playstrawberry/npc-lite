@@ -16,25 +16,28 @@
 //!
 //! Keys are scoped to the plugin that asks: the sender's name comes from the server, so a plugin
 //! cannot reach another plugin's NPCs. A `name` is `null`, a text, or an object with a text per
-//! language (`en`, `fr`, `es`, `tr`). A `skin` is `null`, `{"value","signature"}` or
-//! `{"account":"Name"}`. A field this version does not know is refused: a plugin asking for
-//! something it would not get finds out.
+//! language (`en`, `fr`, `es`, `tr`). A `skin` is `null`, `{"value","signature"}`,
+//! `{"account":"Name"}` or `"viewer"` (each player sees the NPC in his own skin); `texture` and `model` are a skin from the server's resource pack; `actions`
+//! are message and ui actions npc-lite runs itself. A field this version does not know is refused: a plugin
+//! asking for something it would not get finds out.
 //!
-//! A click comes by asking, not by a call back into the owner: the owner listens to
-//! `player-interact-unknown-entity` itself and asks; a call from here into a plugin that is calling
-//! here could leave both waiting.
+//! A click on an NPC without actions comes by asking, not by a call back into the owner: the owner
+//! listens to `player-interact-unknown-entity` itself and asks; a call from here into a plugin that is
+//! calling here could leave both waiting.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::model::{self, Kind, Npc, Place, Skin, Spec};
+use crate::model::{self, Action, Kind, Npc, Place, Skin, SkinModel, SkinPatch, Spec, Trigger};
 use crate::wire;
 
 /// The largest request read: a skin's parts and some room.
 pub const MAX_REQUEST: usize = 64 << 10;
 /// The account name a skin given as textures shows in `/npc info`.
 pub const GIVEN_SKIN: &str = "plugin";
+/// The skin that is each viewer's own.
+pub const VIEWER_SKIN: &str = "viewer";
 
 /// A skin as a plugin asks for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +46,8 @@ pub enum SkinAsk {
     Given(Skin),
     /// Looked up by account name; the NPC has the default skin until the answer comes.
     Account(String),
+    /// Each player who sees the NPC sees it in his own skin.
+    Viewer,
 }
 
 /// A name as a plugin gives it.
@@ -56,7 +61,8 @@ pub struct NameAsk {
 pub enum Request {
     Create {
         key: String,
-        spec: Spec,
+        // Boxed: a spec is several times the size of every other request.
+        spec: Box<Spec>,
         skin: SkinAsk,
     },
     Move {
@@ -102,7 +108,7 @@ pub fn parse(payload: &[u8]) -> Result<Request, String> {
             let (spec, skin) = read_spec(spec)?;
             Ok(Request::Create {
                 key: read_key(object)?,
-                spec,
+                spec: Box::new(spec),
                 skin,
             })
         }
@@ -249,8 +255,9 @@ fn read_name(value: &Value) -> Result<NameAsk, String> {
 fn read_skin(value: &Value) -> Result<SkinAsk, String> {
     let object = match value {
         Value::Null => return Ok(SkinAsk::None),
+        Value::String(word) if word == VIEWER_SKIN => return Ok(SkinAsk::Viewer),
         Value::Object(object) => object,
-        _ => return Err("a skin is null or an object".into()),
+        _ => return Err("a skin is null, \"viewer\" or an object".into()),
     };
     if let Some(account) = object.get("account") {
         only(object, &["account"])?;
@@ -295,10 +302,15 @@ fn read_spec(value: &Value) -> Result<(Spec, SkinAsk), String> {
             "look",
             "baby",
             "sit",
+            "lie",
+            "scale",
             "persist",
             "range",
             "cooldown_ms",
             "permission",
+            "texture",
+            "model",
+            "actions",
         ],
     )?;
     let boolean = |key: &str, default: bool| match object.get(key) {
@@ -330,6 +342,26 @@ fn read_spec(value: &Value) -> Result<(Spec, SkinAsk), String> {
     if baby && !model::can_be_baby(&kind) {
         return Err(format!("a {} has no baby form", model::kind_name(&kind)));
     }
+    let sit = boolean("sit", false)?;
+    let lie = boolean("lie", false)?;
+    if sit && lie {
+        return Err(model::SIT_AND_LIE.into());
+    }
+    let scale = match object.get("scale") {
+        None => model::DEFAULT_SCALE,
+        #[allow(clippy::cast_possible_truncation)]
+        Some(value) => value
+            .as_f64()
+            .map(|scale| scale as f32)
+            .filter(|scale| model::valid_scale(*scale))
+            .ok_or_else(|| {
+                format!(
+                    "a scale is a number from {} to {}",
+                    model::MIN_SCALE,
+                    model::MAX_SCALE
+                )
+            })?,
+    };
     let range = whole("range", model::DEFAULT_RANGE)?;
     if !model::valid_range(range) {
         return Err(format!(
@@ -359,6 +391,11 @@ fn read_spec(value: &Value) -> Result<(Spec, SkinAsk), String> {
         None => SkinAsk::None,
         Some(value) => read_skin(value)?,
     };
+    let skin_patch = read_patch(object, &kind)?;
+    let actions = match object.get("actions") {
+        None => Vec::new(),
+        Some(value) => read_actions(value)?,
+    };
     Ok((
         Spec {
             kind,
@@ -367,17 +404,111 @@ fn read_spec(value: &Value) -> Result<(Spec, SkinAsk), String> {
             names: name.names,
             name_visible: boolean("name_visible", true)?,
             skin: None,
+            viewer_skin: false,
+            skin_patch,
             glow: boolean("glow", false)?,
             look: boolean("look", false)?,
             baby,
-            sit: boolean("sit", false)?,
+            sit,
+            lie,
+            scale,
             persist: boolean("persist", true)?,
             range,
             cooldown_ms,
             permission,
+            actions,
         },
         skin,
     ))
+}
+
+/// `texture` (`namespace:path` in the server's resource pack) and `model` (`wide` or `slim`, only
+/// with a texture), for a player NPC.
+fn read_patch(object: &Map<String, Value>, kind: &Kind) -> Result<Option<SkinPatch>, String> {
+    let Some(texture) = object.get("texture") else {
+        return match object.get("model") {
+            None => Ok(None),
+            Some(_) => Err("a model comes with a texture".into()),
+        };
+    };
+    if *kind != Kind::Player {
+        return Err("only a player NPC has a texture".into());
+    }
+    let texture = texture
+        .as_str()
+        .filter(|t| model::valid_texture(t))
+        .ok_or("a texture is namespace:path of a-z, 0-9, _, -, . and /")?;
+    let model = match object.get("model") {
+        None => SkinModel::Wide,
+        Some(value) => value
+            .as_str()
+            .and_then(model::parse_model)
+            .ok_or("a model is wide or slim")?,
+    };
+    Ok(Some(SkinPatch {
+        texture: texture.to_string(),
+        model,
+    }))
+}
+
+/// What a click does: `[{"on":"right|left|any","message":...}]` or `{"on":...,"ui":"<file>"}`, a
+/// click is a right click unless `on` says otherwise; a message is a text, or an object with a text
+/// per language that has `en` (what a player of any other language reads); `ui` opens the server's
+/// own `user_interface` file of that id, which that plugin opens only when the server owner gave it
+/// a command, key or item. npc-lite runs them on its own click check, so the plugin is not asked
+/// per click.
+fn read_actions(value: &Value) -> Result<Vec<(Trigger, Action)>, String> {
+    let list = value.as_array().ok_or("actions is a list")?;
+    if list.len() > model::MAX_ACTIONS {
+        return Err(format!("at most {} actions", model::MAX_ACTIONS));
+    }
+    let checked = |text: &str| {
+        model::valid_text(text, model::MAX_MESSAGE)
+            .then(|| text.to_string())
+            .ok_or_else(|| "a message is 1 to 512 characters, no control characters".to_string())
+    };
+    let mut actions = Vec::new();
+    for entry in list {
+        let object = entry.as_object().ok_or("an action is an object")?;
+        only(object, &["on", "message", "ui"])?;
+        let on = match object.get("on") {
+            None => Trigger::Right,
+            Some(value) => value
+                .as_str()
+                .and_then(model::parse_trigger)
+                .ok_or("on is right, left or any")?,
+        };
+        if let Some(file) = object.get("ui") {
+            if object.contains_key("message") {
+                return Err("an action is a message or a ui, not both".into());
+            }
+            let file = file
+                .as_str()
+                .filter(|file| model::valid_ui_file(file))
+                .ok_or("a ui is a file id: 1 to 64 of a-z, 0-9, _ . : -")?;
+            actions.push((on, Action::Ui(file.to_string())));
+            continue;
+        }
+        let action = match object.get("message") {
+            Some(Value::String(text)) => Action::message(&checked(text)?),
+            Some(Value::Object(lines)) => {
+                let mut texts = BTreeMap::new();
+                for (language, line) in lines {
+                    let line = line.as_str().ok_or("a message is text")?;
+                    texts.insert(language.clone(), checked(line)?);
+                }
+                if !model::valid_texts(&texts, model::MAX_MESSAGE) {
+                    return Err("a message's language is en, fr, es or tr".into());
+                }
+                let text = texts.remove("en").ok_or("a message per language has en")?;
+                Action::Message { text, texts }
+            }
+            Some(_) => return Err("a message is a text or an object per language".into()),
+            None => return Err("an action is a message or a ui".into()),
+        };
+        actions.push((on, action));
+    }
+    Ok(actions)
 }
 
 /// What an NPC is, as `get` answers: the skin's textures are left out, they carry an account's
@@ -393,7 +524,11 @@ pub fn describe(key: &str, npc: &Npc) -> Value {
         "name": npc.name,
         "names": npc.names,
         "name_visible": npc.name_visible,
-        "skin": npc.skin.as_ref().map(|skin| skin.from.as_str()),
+        "skin": if npc.viewer_skin {
+            Some(VIEWER_SKIN)
+        } else {
+            npc.skin.as_ref().map(|skin| skin.from.as_str())
+        },
         "place": {
             "world": npc.place.world,
             "x": npc.place.x,
@@ -406,10 +541,15 @@ pub fn describe(key: &str, npc: &Npc) -> Value {
         "look": npc.look,
         "baby": npc.baby,
         "sit": npc.sit,
+        "lie": npc.lie,
+        "scale": npc.scale,
         "persist": npc.persist,
         "range": npc.range,
         "cooldown_ms": npc.cooldown_ms,
         "permission": npc.permission,
+        "texture": npc.skin_patch.as_ref().map(|patch| patch.texture.as_str()),
+        "model": npc.skin_patch.as_ref().map(|patch| model::model_name(patch.model)),
+        "actions": npc.actions.len(),
     })
 }
 
@@ -429,7 +569,7 @@ mod tests {
         match create(spec_fields).unwrap() {
             Request::Create { key, spec, skin } => {
                 assert_eq!(key, "boss");
-                (spec, skin)
+                (*spec, skin)
             }
             other => panic!("{other:?}"),
         }
@@ -442,8 +582,9 @@ mod tests {
         assert_eq!(spec.place.world, "moon");
         assert_eq!(spec.name, None);
         assert!(spec.name_visible && spec.persist);
-        assert!(!spec.glow && !spec.look && !spec.baby && !spec.sit);
+        assert!(!spec.glow && !spec.look && !spec.baby && !spec.sit && !spec.lie);
         assert_eq!(spec.range, model::DEFAULT_RANGE);
+        assert!((spec.scale - model::DEFAULT_SCALE).abs() < f32::EPSILON);
         assert_eq!(spec.cooldown_ms, model::DEFAULT_COOLDOWN_MS);
         assert_eq!(skin, SkinAsk::None);
     }
@@ -453,7 +594,7 @@ mod tests {
         let (spec, skin) = created(
             r#","type":"minecraft:piglin","name":{"en":"&2Worker","tr":"&2Çalışan"},"name_visible":false,
                "skin":{"account":"Notch"},"glow":true,"look":true,"baby":true,"sit":true,"persist":false,
-               "range":64,"cooldown_ms":1000,"permission":"server.vip""#,
+               "range":64,"scale":3,"cooldown_ms":1000,"permission":"server.vip""#,
         );
         assert_eq!(spec.kind, Kind::Mob("piglin".into()));
         assert_eq!(
@@ -465,6 +606,7 @@ mod tests {
         assert!(!spec.name_visible && spec.glow && spec.look && spec.baby && spec.sit);
         assert!(!spec.persist);
         assert_eq!(spec.range, 64);
+        assert!((spec.scale - 3.0).abs() < f32::EPSILON);
         assert_eq!(spec.cooldown_ms, 1000);
         assert_eq!(spec.permission.as_deref(), Some("server.vip"));
         assert_eq!(skin, SkinAsk::Account("Notch".into()));
@@ -483,6 +625,43 @@ mod tests {
     }
 
     #[test]
+    fn a_create_reads_lie_and_get_answers_it() {
+        let (spec, _) = created(r#","type":"minecraft:zombie","lie":true"#);
+        assert!(spec.lie && !spec.sit);
+        let (spec, _) = created(r#","lie":false,"sit":true"#);
+        assert!(!spec.lie && spec.sit);
+        assert_eq!(
+            create(r#","sit":true,"lie":true"#).unwrap_err(),
+            model::SIT_AND_LIE
+        );
+        let (lying, _) = created(r#","lie":true"#);
+        let mut store = model::Store::default();
+        store.put_owned("core", "boss", lying, (1, 2)).unwrap();
+        let answer = describe("boss", &store.npcs["core.boss"]);
+        assert_eq!(answer["lie"], json!(true));
+        assert_eq!(answer["sit"], json!(false));
+    }
+
+    #[test]
+    fn a_viewer_skin_is_asked_with_one_word_and_get_answers_it() {
+        let (mut spec, skin) = created(r#","skin":"viewer""#);
+        assert_eq!(skin, SkinAsk::Viewer);
+        for bad in [
+            r#","skin":"Viewer""#,
+            r#","skin":"mirror""#,
+            r#","skin":{"viewer":true}"#,
+            r#","skin":true"#,
+        ] {
+            assert!(create(bad).is_err(), "{bad}");
+        }
+        spec.viewer_skin = true;
+        let mut store = model::Store::default();
+        store.put_owned("lobby", "guide", spec, (1, 2)).unwrap();
+        let answer = describe("guide", &store.npcs["lobby.guide"]);
+        assert_eq!(answer["skin"], json!("viewer"));
+    }
+
+    #[test]
     fn what_cannot_be_given_is_refused_never_dropped() {
         for bad in [
             r#","equipment":[]"#,
@@ -491,9 +670,16 @@ mod tests {
             r#","type":7"#,
             r#","range":500"#,
             r#","range":"far""#,
+            r#","scale":0"#,
+            r#","scale":0.06"#,
+            r#","scale":16.5"#,
+            r#","scale":-2"#,
+            r#","scale":"big""#,
             r#","cooldown_ms":999999"#,
             r#","baby":true"#,
             r#","glow":"yes""#,
+            r#","lie":"yes""#,
+            r#","sit":true,"lie":true"#,
             r#","name":"""#,
             r#","name":{"de":"x"}"#,
             r#","name":{"en":""}"#,
@@ -531,6 +717,101 @@ mod tests {
         }
         assert!(parse(&[0xFF, 0xFE]).is_err());
         assert!(parse(&vec![b' '; MAX_REQUEST + 1]).is_err());
+    }
+
+    #[test]
+    fn an_unknown_option_op_or_action_is_refused_with_its_name() {
+        // The README's "For other scripts: IPC" says a script finds out what this version lacks.
+        assert_eq!(
+            create(r#","wings":true"#).unwrap_err(),
+            "unknown field wings"
+        );
+        assert_eq!(parse(br#"{"op":"dance"}"#).unwrap_err(), "unknown op dance");
+        assert_eq!(
+            parse(br#"{"op":"get","key":"boss","extra":1}"#).unwrap_err(),
+            "unknown field extra"
+        );
+        // A command or console action is the server owner's, set with /npc: never over IPC.
+        for kind in ["command", "console"] {
+            let spec = format!(r#","actions":[{{"{kind}":"say hi"}}]"#);
+            assert_eq!(
+                create(&spec).unwrap_err(),
+                format!("unknown field {kind}"),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_create_reads_a_pack_texture_and_message_actions() {
+        let (spec, _) = created(r#","texture":"br:npc/watcher","model":"slim""#);
+        assert_eq!(
+            spec.skin_patch,
+            Some(SkinPatch {
+                texture: "br:npc/watcher".into(),
+                model: SkinModel::Slim,
+            })
+        );
+        let (wide, _) = created(r#","texture":"br:npc/watcher""#);
+        assert_eq!(wide.skin_patch.map(|p| p.model), Some(SkinModel::Wide));
+        let (spec, _) = created(
+            r#","actions":[{"on":"left","message":"Hi {player}"},
+                           {"message":{"en":"Welcome","tr":"Hoş geldin","fr":"Bienvenue"}}]"#,
+        );
+        assert_eq!(
+            spec.actions,
+            vec![
+                (Trigger::Left, Action::message("Hi {player}")),
+                (
+                    Trigger::Right,
+                    Action::Message {
+                        text: "Welcome".into(),
+                        texts: BTreeMap::from([
+                            ("fr".to_string(), "Bienvenue".to_string()),
+                            ("tr".to_string(), "Hoş geldin".to_string()),
+                        ]),
+                    }
+                ),
+            ],
+            "a click is a right click unless told; English is the line of every other language"
+        );
+        let (ui, _) = created(r#","actions":[{"ui":"notebook"},{"on":"left","ui":"br:map"}]"#);
+        assert_eq!(
+            ui.actions,
+            vec![
+                (Trigger::Right, Action::Ui("notebook".into())),
+                (Trigger::Left, Action::Ui("br:map".into())),
+            ]
+        );
+        let (none, _) = created("");
+        assert!(none.actions.is_empty() && none.skin_patch.is_none());
+        let many = format!(
+            r#","actions":[{}]"#,
+            vec![r#"{"message":"x"}"#; model::MAX_ACTIONS + 1].join(",")
+        );
+        for bad in [
+            r#","model":"slim""#,
+            r#","type":"villager","texture":"br:npc/watcher""#,
+            r#","texture":"BR:npc""#,
+            r#","texture":7"#,
+            r#","texture":"br:npc/watcher","model":"classic""#,
+            r#","actions":{}"#,
+            r#","actions":[{"on":"right"}]"#,
+            r#","actions":[{"on":"middle","message":"x"}]"#,
+            r#","actions":[{"message":"x","extra":1}]"#,
+            r#","actions":[{"command":"spawn"}]"#,
+            r#","actions":[{"message":""}]"#,
+            r#","actions":[{"message":{"tr":"Merhaba"}}]"#,
+            r#","actions":[{"message":{"en":"Hi","de":"Hallo"}}]"#,
+            r#","actions":[{"message":7}]"#,
+            r#","actions":[{"ui":"notebook","message":"x"}]"#,
+            r#","actions":[{"ui":"../notebook"}]"#,
+            r#","actions":[{"ui":""}]"#,
+            r#","actions":[{"ui":7}]"#,
+            many.as_str(),
+        ] {
+            assert!(create(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -602,7 +883,16 @@ mod tests {
         assert_eq!(value["persist"], true);
         assert_eq!(value["skin"], "Notch");
         assert_eq!(value["place"]["world"], "moon");
+        assert_eq!(value["texture"], serde_json::Value::Null);
+        assert_eq!(value["actions"], 0);
         let text = value.to_string();
         assert!(!text.contains("SECRET"), "{text}");
+        let (patched, _) =
+            created(r#","texture":"br:npc/watcher","model":"slim","actions":[{"message":"Hi"}]"#);
+        store.put_owned("core", "watcher", patched, (3, 4)).unwrap();
+        let value = describe("watcher", &store.npcs["core.watcher"]);
+        assert_eq!(value["texture"], "br:npc/watcher");
+        assert_eq!(value["model"], "slim");
+        assert_eq!(value["actions"], 1);
     }
 }
