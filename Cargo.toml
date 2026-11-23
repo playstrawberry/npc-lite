@@ -1,6 +1,6 @@
 [package]
 name = "npc-lite"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Strawberry first-party plugin: NPCs that exist only as packets, for vanilla clients."
 authors = ["Strawberry Interactive LLC"]
@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 command-rules = { path = "libs/command-rules" }
-strawberry-plugin-api = { version = "=0.2.2", registry = "strawberry" }
+strawberry-plugin-api = { version = "=0.2.3", registry = "strawberry" }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
 # A repository of its own, not a member of a larger workspace.
